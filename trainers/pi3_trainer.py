@@ -51,13 +51,13 @@ class Pi3Trainer(BaseTrainer):
 
     def before_epoch(self, epoch):
         if hasattr(self.train_loader, 'dataset') and hasattr(self.train_loader.dataset, 'set_epoch'):
-            self.train_loader.dataset.set_epoch(epoch, base_seed=self.cfg.train.base_seed)
+            self.train_loader.dataset.set_epoch(epoch, base_seed=self.cfg.train.base_seed) # 把数据集顺序打乱
         if hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, 'set_epoch'):
             self.train_loader.sampler.set_epoch(epoch, base_seed=self.cfg.train.base_seed)
         if hasattr(self.train_loader, 'batch_sampler') and hasattr(self.train_loader.batch_sampler, 'batch_sampler') and hasattr(self.train_loader.batch_sampler.batch_sampler, 'sampler') and hasattr(self.train_loader.batch_sampler.batch_sampler.sampler, 'set_epoch'):       # handle acclerate warpped dataloader (more gpu)
             self.train_loader.batch_sampler.batch_sampler.sampler.set_epoch(epoch, base_seed=self.cfg.train.base_seed)
         if hasattr(self.train_loader, 'batch_sampler') and hasattr(self.train_loader.batch_sampler, 'set_epoch'):       # handle acclerate warpped dataloader (more gpu)
-            self.train_loader.batch_sampler.set_epoch(epoch, base_seed=self.cfg.train.base_seed)
+            self.train_loader.batch_sampler.set_epoch(epoch, base_seed=self.cfg.train.base_seed) # 随机帧数和分辨率
         
 
         if hasattr(self.test_loader, 'dataset') and hasattr(self.test_loader.dataset, 'set_epoch'):

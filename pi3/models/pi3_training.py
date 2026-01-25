@@ -28,7 +28,8 @@ class Pi3(nn.Module):
             self,
             pos_type='rope100',
             decoder_size='large',
-            load_vggt=True,
+            load_vggt=False,
+            load_pi3=True,
             freeze_encoder=True,
             use_global_points=False,
             train_conf=False,
@@ -174,16 +175,16 @@ class Pi3(nn.Module):
             print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
 
         self.train_conf = train_conf
-        if train_conf:
-            assert ckpt is not None
+        if train_conf or load_pi3:
+            assert ckpt is not None or load_pi3, "Please provide pi3 checkpoint to load confidence decoder."
 
             # ----------------------
             #     Conf Decoder
             # ----------------------
             self.conf_decoder = deepcopy(self.point_decoder)
             self.conf_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=1)
-
-            freeze_all_params([self.encoder, self.decoder, self.point_decoder, self.point_head, self.camera_decoder,  self.camera_head, self.register_token])
+            if train_conf:
+                freeze_all_params([self.encoder, self.decoder, self.point_decoder, self.point_head, self.camera_decoder,  self.camera_head, self.register_token])
             if use_global_points:
                 freeze_all_params([self.global_points_decoder, self.global_point_head])
 
@@ -201,6 +202,9 @@ class Pi3(nn.Module):
 
             del checkpoint
             torch.cuda.empty_cache()
+        elif load_pi3:
+            pi3_weight = load_file('ckpts/Pi3/model_pi3.safetensors')
+            print("Loading pi3 weights", self.load_state_dict(pi3_weight, strict=False))
 
     def decode(self, hidden, N, H, W):
         BN, hw, _ = hidden.shape

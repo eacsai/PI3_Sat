@@ -10,10 +10,17 @@ from datasets.base.transforms import *
 import json
 from tqdm import tqdm
 
+def get_text(path):
+    """
+    读取文件路径并返回其中的所有文本内容。
+    """
+    with open(path, 'r') as f:
+        return f.read()
+
 class ScannetDataset(BaseDataset):
     def __init__(
         self,
-        data_root=None,
+        data_root='/data/dataset/scannet',
         verbose=False,
         max_distance=240,                    # 80
         **kwargs
@@ -32,15 +39,47 @@ class ScannetDataset(BaseDataset):
         if mode == 'train':
             self.sequences = [seq for seq in self.sequences if int(seq.split('_')[0][5:]) <= 660]
         else:
-            self.sequences = [seq for seq in self.sequences if int(seq.split('_')[0][5:]) > 660]
+            # TODO: use >660 other sequences for val/test
+            self.sequences = [seq for seq in self.sequences if int(seq.split('_')[0][5:]) <= 660]
 
         if self.verbose:
             print(f'[{self.dataset_label}] Sequences of {self.dataset_label} dataset:', self.sequences)
 
         print(f'[{self.dataset_label}] Found %d unique videos in %s' % (len(self.sequences), data_root), flush=True)
 
-        with open('data/scannet_invalid_list.json') as f:
-            self.invalid_list = json.load(f)
+        # Cache file path for invalid_list
+        invalid_list_cache_path = 'data/scannet_invalid_list.json'
+
+        # Try to load from cache first
+        if os.path.exists(invalid_list_cache_path):
+            print(f'[{self.dataset_label}] Loading invalid_list from cache: {invalid_list_cache_path}')
+            with open(invalid_list_cache_path, 'r') as f:
+                self.invalid_list = json.load(f)
+        else:
+            # Build invalid_list from scratch
+            self.invalid_list = {}
+            for seq in self.sequences:
+                self.invalid_list[seq] = []
+                rgb_path = os.path.join(data_root, seq, 'color')
+                cam_path = os.path.join(data_root, seq, 'pose')
+
+                num_image = len(os.listdir(rgb_path))
+
+                for i in tqdm(range(num_image), desc=seq):
+                    try:
+                        pose_txt = get_text(os.path.join(cam_path, f'{i}.txt'))
+                        camera_pose = np.array([float(x) for x in pose_txt.split()]).astype(np.float32).reshape(4, 4)
+                        if np.isinf(camera_pose).any() or np.isnan(camera_pose).any():
+                            self.invalid_list[seq].append(i)
+                            print(f'Invalid pose found: {seq}, frame {i}')
+                    except Exception as e:
+                        self.invalid_list[seq].append(i)
+
+            # Save to cache
+            os.makedirs(os.path.dirname(invalid_list_cache_path), exist_ok=True)
+            with open(invalid_list_cache_path, 'w') as f:
+                json.dump(self.invalid_list, f)
+            print(f'[{self.dataset_label}] Saved invalid_list to cache: {invalid_list_cache_path}')
 
         if not os.path.exists(f'data/dataset_cache/scannetmv_{self.mode}_cache.npy'):
             self.num_imgs = {}
@@ -133,7 +172,7 @@ class ScannetDataset(BaseDataset):
 
             rgb_image = np.array(Image.open(impath).resize((640, 480), resample=lanczos))
 
-            depthmap = Image.open(disppath).astype(np.float32) / 1000.
+            depthmap = np.ones((480, 640, 1)).astype(np.float32) # Convert to meters
 
             rgb_image, depthmap, intrinsic_ = self._crop_resize_if_necessary(
                 rgb_image, depthmap, intrinsic.copy(), resolution, rng=rng, info=impath)

@@ -197,6 +197,7 @@ class DynamicBatchSampler(Sampler):
     def __len__(self):
         # Return a large dummy length
         # return 1000000
+        # 决定了训练epoch的长度（最多有几个batch), 可以设置的非常大，因为上面的while True:会自动停止
         return len(self.sampler) // self.image_num_range[0]            # dummy value because of dynamic batchsize
 
 
@@ -214,6 +215,13 @@ class DynamicDistributedSampler(DistributedSampler):
         seed: int = 0,
         drop_last: bool = False,
     ):
+        import torch.distributed as dist
+
+        # If distributed is not initialized, use num_replicas=1, rank=0
+        if not dist.is_available() or not dist.is_initialized():
+            num_replicas = 1
+            rank = 0
+
         super().__init__(
             dataset,
             num_replicas=num_replicas,

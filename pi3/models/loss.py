@@ -249,12 +249,63 @@ class Pi3Loss(nn.Module):
     def __init__(
         self,
         train_conf=False,
+        save_vis=False,
+        save_vis_dir='outputs/vis_ply',
     ):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
         self.camera_loss = CameraLoss()
 
-    def prepare_gt(self, gt):
+        self.save_vis = save_vis
+        self.save_vis_dir = save_vis_dir
+        self.vis_call_count = 0
+
+        if self.save_vis:
+            import os
+            os.makedirs(self.save_vis_dir, exist_ok=True)
+
+    def save_point_cloud_vis(self, points, masks, images, prefix='pred'):
+        """保存点云到 .ply 文件（保存第一个 batch 所有帧到一个文件）"""
+        from ..utils.basic import write_ply
+        import os
+
+        B, N, H, W, _ = points.shape
+
+        # 收集第一个 batch 所有帧的有效点
+        all_pts = []
+        all_rgb = []
+
+        for n in range(N):
+            mask = masks[0, n]
+            if mask.sum() == 0:
+                continue
+
+            pts = points[0, n][mask]
+            all_pts.append(pts)
+
+            # 提取颜色
+            if images is not None:
+                img = images[0, n].permute(1, 2, 0)[mask]
+                rgb = img.float() / 255.0 if img.max() > 1 else img.float()
+            else:
+                # 使用深度生成颜色
+                depth = points[0, n, ..., 2][mask]
+                depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+                rgb = torch.stack([depth_norm, 1 - depth_norm, torch.zeros_like(depth_norm)], dim=-1)
+            all_rgb.append(rgb)
+
+        if len(all_pts) == 0:
+            return
+
+        # 合并所有帧的点
+        merged_pts = torch.cat(all_pts, dim=0)
+        merged_rgb = torch.cat(all_rgb, dim=0)
+
+        filename = f"{prefix}_call.ply"
+        filepath = os.path.join(self.save_vis_dir, filename)
+        write_ply(merged_pts.cpu(), merged_rgb.cpu(), filepath)
+
+    def prepare_gt(self, gt, save_vis=False):
         gt_pts = torch.stack([view['pts3d'] for view in gt], dim=1)
         masks = torch.stack([view['valid_mask'] for view in gt], dim=1)
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
@@ -281,8 +332,12 @@ class Pi3Loss(nn.Module):
 
         extrinsics = se3_inverse(poses)
         gt_local_pts = torch.einsum('bnij, bnhwj -> bnhwi', extrinsics, homogenize_points(gt_pts))[..., :3]
-        
         dataset_names = gt[0]['dataset']
+
+        # 可视化保存点云
+        if self.save_vis:
+            imgs = torch.stack([view['img'] for view in gt], dim=1)
+            self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global')
 
         return dict(
             imgs = torch.stack([view['img'] for view in gt], dim=1),
@@ -293,7 +348,7 @@ class Pi3Loss(nn.Module):
             dataset_names=dataset_names
         )
     
-    def normalize_pred(self, pred, gt):
+    def normalize_pred(self, pred, gt, save_vis=False):
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
         B, N, H, W, _ = local_points.shape
@@ -315,6 +370,12 @@ class Pi3Loss(nn.Module):
 
         pred['local_points'] = local_points
         pred['camera_poses'] = camera_poses_normalized
+
+        # 可视化保存点云（将 local_points 转换到世界坐标系）
+        if self.save_vis:
+            # local_points -> world_points: 使用 camera_poses_normalized 进行变换
+            pred_global_from_local = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses_normalized, homogenize_points(local_points))[..., :3]
+            self.save_point_cloud_vis(pred_global_from_local, masks, gt['imgs'], prefix='pred_global')
 
         return pred
 
