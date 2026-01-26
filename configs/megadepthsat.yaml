@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - model: pi3_megadepth.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: megadepthsat.yaml
+  - general: megadepthsat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_

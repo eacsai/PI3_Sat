@@ -274,6 +274,7 @@ class Pi3(nn.Module):
             global_point_hidden = self.global_points_decoder(hidden, context, xpos=pos, ypos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
+            # TODO: 对于卫星图，不需要预测深度的对数，也不要把xy*z，而是直接预测x,y,z
             # local points
             point_hidden = point_hidden.float()
             ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)

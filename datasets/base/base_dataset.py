@@ -124,7 +124,7 @@ class BaseDataset(EasyDataset):
 
         self.num_resoluions = len(self._resolutions)
 
-    def _crop_resize_if_necessary(self, image, depthmap, intrinsics, resolution, rng=None, info=None, normal=None, far_mask=None):
+    def _crop_resize_if_necessary(self, image, depthmap, intrinsics, resolution, rng=None, info=None, normal=None, far_mask=None, sat=False):
         """ This function:
             - first downsizes the image with LANCZOS inteprolation,
               which is better than bilinear interpolation in
@@ -160,12 +160,13 @@ class BaseDataset(EasyDataset):
 
         # high-quality Lanczos down-scaling
         target_resolution = np.array(resolution)
-        if self.aug_focal:
-            crop_scale = self.aug_focal + (1.0 - self.aug_focal) * np.random.beta(0.5, 0.5) # beta distribution, bi-modal
-            image, depthmap, intrinsics, normal, far_mask = cropping.center_crop_image_depthmap(image, depthmap, intrinsics, crop_scale, normal=normal, far_mask=far_mask)
+        if not sat:
+            if self.aug_focal:
+                crop_scale = self.aug_focal + (1.0 - self.aug_focal) * np.random.beta(0.5, 0.5) # beta distribution, bi-modal
+                image, depthmap, intrinsics, normal, far_mask = cropping.center_crop_image_depthmap(image, depthmap, intrinsics, crop_scale, normal=normal, far_mask=far_mask)
 
-        if self.aug_crop > 1:
-            target_resolution += rng.integers(0, self.aug_crop)
+            if self.aug_crop > 1:
+                target_resolution += rng.integers(0, self.aug_crop)
         image, depthmap, intrinsics, normal, far_mask = cropping.rescale_image_depthmap(image, depthmap, intrinsics, target_resolution, normal=normal, far_mask=far_mask) # slightly scale the image a bit larger than the target resolution
 
         # actual cropping (if necessary) with bilinear interpolation

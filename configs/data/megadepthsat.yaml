@@ -1,0 +1,45 @@
+# @package _global_
+
+train_dataset:
+    length: 2500         # dummy
+
+    weights: 
+        MegaDepth: 2500
+
+    MegaDepth:
+        _target_: datasets.megadepthsat_dataset.MegaDepthSatDataset
+        data_root: /data/zhongyao/aer-grd-map/train_files_1107.txt  # 修改为你的 MegaDepth 数据集路径
+        z_far: 30000
+        frame_num: 3
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: 'train'
+        shuffle: false
+
+train_dataloader:
+    drop_last: True
+    shuffle: True
+
+test_dataset:
+    weights: 
+        MegaDepth: 400
+
+    MegaDepth:
+        _target_: datasets.megadepth_dataset.MegaDepthDataset
+        data_root: /data/zhongyao/aer-grd-map/test_files_1107.txt  # 修改为你的 MegaDepth 数据集路径
+        z_far: 30000
+        frame_num: 3
+        resolution:
+            - [320, 160]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+        shuffle: false
+
+test_dataloader:
+    drop_last: False
+    shuffle: False
