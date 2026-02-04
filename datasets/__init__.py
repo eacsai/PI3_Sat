@@ -71,7 +71,10 @@ def create_dataloader(cfg, mode):
     world_size = get_world_size()
     rank = get_rank()
 
-    image_num_range = cfg.train.image_num_range if mode == 'train' else [2, 2]
+    # TODO: Why original code use different image_num_range for train and test
+    # image_num_range = cfg.train.image_num_range if mode == 'train' else [2, 2]
+    image_num_range = cfg.train.image_num_range
+
     print(f'Sampling frame number range from {image_num_range}')
     # adapte from vggt
     max_img_per_gpu = cfg.train.max_img_per_gpu if 'max_img_per_gpu' in cfg.train else image_num_range[0]

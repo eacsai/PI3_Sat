@@ -590,14 +590,16 @@ class BaseTrainer:
 
         if path is None:
             self.log_info("Checkpoint does not exist. Starting a new training run.")
-            
             start_epoch = 0
         else:
             self.log_info(f"Resuming from checkpoint {path}")
-            self.accelerator.load_state(
-                # os.path.join(self.cfg.log.ckpt_dir, path)
-                path
-            )
+            try:
+                self.accelerator.load_state(path)
+            except ValueError as e:
+                self.log_info(f"Failed to load full state (optimizer mismatch): {e}")
+                self.log_info("Loading model weights only...")
+                # 只加载模型权重，跳过optimizer和scheduler状态
+                self._load_model_weights_only(path)
             # Extract epoch number from checkpoint path
             # Handles both "checkpoint_N" and "best_model" formats
             if "checkpoint_" in path:
@@ -610,6 +612,25 @@ class BaseTrainer:
                 start_epoch = 0
 
         return start_epoch
+
+    def _load_model_weights_only(self, checkpoint_path):
+        """只加载模型权重，跳过optimizer和scheduler状态"""
+        import torch
+
+        # 加载模型权重文件
+        model_path = os.path.join(checkpoint_path, "model_weights.bin")
+        if not os.path.exists(model_path):
+            # 尝试使用pytorch_model.bin
+            model_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+
+        if os.path.exists(model_path):
+            state_dict = torch.load(model_path, map_location='cpu')
+            # 加载到模型中（unwrap因为模型可能被accelerator包装）
+            model = self.accelerator.unwrap_model(self.model)
+            model.load_state_dict(state_dict, strict=False)
+            self.log_info(f"Loaded model weights from {model_path}")
+        else:
+            self.log_info(f"Model weights file not found in {checkpoint_path}")
 
     def log_info(self, info):
         if is_logging_process():

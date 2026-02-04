@@ -4,9 +4,9 @@ train_dataset:
     length: 2500         # dummy
 
     weights: 
-        MegaDepth: 2500
+        MegaDepthSat: 2500
 
-    MegaDepth:
+    MegaDepthSat:
         _target_: datasets.megadepthsat_dataset.MegaDepthSatDataset
         data_root: /data/zhongyao/aer-grd-map/train_files_1107.txt  # 修改为你的 MegaDepth 数据集路径
         z_far: 30000
@@ -25,10 +25,10 @@ train_dataloader:
 
 test_dataset:
     weights: 
-        MegaDepth: 400
+        MegaDepthSat: 400
 
-    MegaDepth:
-        _target_: datasets.megadepth_dataset.MegaDepthDataset
+    MegaDepthSat:
+        _target_: datasets.megadepthsat_dataset.MegaDepthSatDataset
         data_root: /data/zhongyao/aer-grd-map/test_files_1107.txt  # 修改为你的 MegaDepth 数据集路径
         z_far: 30000
         frame_num: 3

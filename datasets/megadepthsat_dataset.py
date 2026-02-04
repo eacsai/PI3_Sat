@@ -13,7 +13,7 @@ import OpenEXR
 import torch.nn.functional as F
 import random
 
-PI3_RES_METER = 200 # meters
+PI3_RES_METER = 140 # meters
 PI3_RES = 512  # pixels
 
 colmap_to_opencv = np.array([
@@ -47,7 +47,7 @@ class MegaDepthSatDataset(BaseDataset):
         assert data_root is not None
 
         self.verbose = verbose
-        self.dataset_label = 'MegaDepth'
+        self.dataset_label = 'megadepthsat'
         mode = self.mode
         self.data_root = data_root
 
@@ -82,6 +82,7 @@ class MegaDepthSatDataset(BaseDataset):
                 })
 
         self.sat_height = 3400.0 # meters
+        self.sat_gap = 300.0  # meters
         sat_fx = self.sat_height / (PI3_RES_METER / PI3_RES) # 512是卫星图的像素分辨率
         sat_fy = self.sat_height / (PI3_RES_METER / PI3_RES)
         sat_cx = PI3_RES / 2
@@ -142,7 +143,7 @@ class MegaDepthSatDataset(BaseDataset):
                 rgb_image = np.array(rgb_image) # numpy shape (H, W, 3), uint8
                 depth_path = impath.replace('.jpg', '.exr')
                 depthmap = load_depth_exr(depth_path) # numpy shape (H, W)
-                depthmap[depthmap > 200] = -1 # cap depth to 300 meters
+                depthmap[depthmap > 300] = -1 # cap depth to 300 meters
                 # load camera params
                 npz_path = impath.replace('.jpeg.jpg', '.jpeg.npz')
                 camera_pose = np.load(npz_path)['cam2world'].astype(np.float32)
@@ -194,6 +195,8 @@ class MegaDepthSatDataset(BaseDataset):
                 dataset=self.dataset_label,
                 label=f'mega_depth_{key}_{index}',
                 instance=str(key + str(index)),
+                sat_height=self.sat_height,
+                sat_gap=self.sat_gap
             ))
 
         lst = [0, 1]

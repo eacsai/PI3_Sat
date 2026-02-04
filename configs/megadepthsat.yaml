@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - model: pi3_megadepth.yaml
+  - model: pi3_megadepthsat.yaml
   - train: train_pi3_lowres_megadepth
   - data: megadepthsat.yaml
   - general: megadepthsat.yaml

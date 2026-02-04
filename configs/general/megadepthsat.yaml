@@ -1,14 +1,15 @@
 # @package _global_
 
-name: 'pi3_init_megadepthsat'
+name: 'pi3_init_megadepthsat_refineloss+decoderplus+sattoken'
 working_dir: ${work_dir}
 random_seed: 1111
 
 log:
   # output_dir: '${work_dir}/outputs/${name}-${now:%Y-%m-%d_%H-%M-%S}'
   output_dir: '${work_dir}/outputs/${name}'
+  # TODO: DEBUG CHANGE
   use_tensorboard: false
-  use_wandb: true
+  use_wandb: false
   wandb_init_conf:
     name: ${name}
     entity: ethan-predator

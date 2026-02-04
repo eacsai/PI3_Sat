@@ -3,11 +3,14 @@ import torch.nn.functional as F
 import torch.nn as nn
 from typing import *
 import math
+import os
 
 from ..utils.geometry import homogenize_points, se3_inverse, depth_edge
 from ..utils.alignment import align_points_scale
+import torchvision.transforms.functional as TF
 
 from datasets import __HIGH_QUALITY_DATASETS__, __MIDDLE_QUALITY_DATASETS__
+to_pil_image = TF.to_pil_image
 
 # ---------------------------------------------------------------------------
 # Some functions from MoGe
@@ -250,7 +253,7 @@ class Pi3Loss(nn.Module):
         self,
         train_conf=False,
         save_vis=False,
-        save_vis_dir='outputs/vis_ply',
+        save_vis_dir='data/vis_ply',
     ):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
@@ -259,7 +262,6 @@ class Pi3Loss(nn.Module):
         self.save_vis = save_vis
         self.save_vis_dir = save_vis_dir
         self.vis_call_count = 0
-
         if self.save_vis:
             import os
             os.makedirs(self.save_vis_dir, exist_ok=True)
@@ -305,13 +307,14 @@ class Pi3Loss(nn.Module):
         filepath = os.path.join(self.save_vis_dir, filename)
         write_ply(merged_pts.cpu(), merged_rgb.cpu(), filepath)
 
-    def prepare_gt(self, gt, save_vis=False):
+    def prepare_gt(self, gt, sat_height=0.0):
         gt_pts = torch.stack([view['pts3d'] for view in gt], dim=1)
         masks = torch.stack([view['valid_mask'] for view in gt], dim=1)
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
 
         B, N, H, W, _ = gt_pts.shape
-
+        if sat_height > 0.0:
+            poses[:, :1, 1, 3] += sat_height
         # transform to first frame camera coordinate
         w2c_target = se3_inverse(poses[:, 0])
         gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
@@ -338,6 +341,8 @@ class Pi3Loss(nn.Module):
         if self.save_vis:
             imgs = torch.stack([view['img'] for view in gt], dim=1)
             self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global')
+            test_img = to_pil_image(imgs[0, 1])
+            test_img.save('test_img.png')
 
         return dict(
             imgs = torch.stack([view['img'] for view in gt], dim=1),
@@ -348,7 +353,7 @@ class Pi3Loss(nn.Module):
             dataset_names=dataset_names
         )
     
-    def normalize_pred(self, pred, gt, save_vis=False):
+    def normalize_pred(self, pred, gt):
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
         B, N, H, W, _ = local_points.shape
@@ -380,19 +385,82 @@ class Pi3Loss(nn.Module):
         return pred
 
     def forward(self, pred, gt_raw):
-        gt = self.prepare_gt(gt_raw)
-        pred = self.normalize_pred(pred, gt)
+        if 'megadepthsat' in gt_raw[0]['dataset']:
+            # For Grd and Drone Views
+            gt_normalized = self.prepare_gt(gt_raw, sat_height=gt_raw[0]['sat_height'][0]-gt_raw[0]['sat_gap'][0])
+        else:
+            gt_normalized = self.prepare_gt(gt_raw)
+        pred_normalized = self.normalize_pred(pred, gt_normalized)
 
         final_loss = 0.0
         details = dict()
 
+        # 可视化深度分布直方图（区间占比，总和为1）
+        # for v in range(len(gt_raw)):
+        #     import matplotlib.pyplot as plt
+        #     import numpy as np
+
+        #     # 获取当前视角的深度和Mask
+        #     local_pts = gt_normalized['local_points'][:, v, :, :, 2]  # [B, H, W]
+        #     valid_mask = gt_normalized['valid_masks'][:, v, :, :]     # [B, H, W]
+            
+        #     # 计算总有效像素数（分母）
+        #     total_valid = valid_mask.sum() + 1e-8  # 防止除以0
+
+        #     # 定义区间：0.0-0.1, 0.1-0.2, ..., 0.9-1.0
+        #     ratios = []
+        #     labels = []
+            
+        #     for i in range(10):
+        #         lower = i / 10.0
+        #         upper = (i + 1) / 10.0
+                
+        #         # 核心修改：计算落在 [lower, upper) 区间内的点
+        #         # 注意：最后一个区间 0.9-1.0 我们通常设为闭区间 [0.9, 1.0] 以包含 1.0
+        #         if i == 9:
+        #             mask_in_range = (local_pts >= lower) & (local_pts <= upper) & valid_mask
+        #         else:
+        #             mask_in_range = (local_pts >= lower) & (local_pts < upper) & valid_mask
+                
+        #         ratio = mask_in_range.sum() / total_valid
+        #         ratios.append(ratio.item())
+        #         labels.append(f'{upper:.1f}') # X轴标签显示 0.1, 0.2...
+
+        #     # 创建保存目录
+        #     vis_dir = 'data/depth_distribution_vis'
+        #     os.makedirs(vis_dir, exist_ok=True)
+
+        #     # 绘制柱状图
+        #     plt.figure(figsize=(10, 6))
+            
+        #     # 绘制柱子，并在柱子上方显示具体数值
+        #     bars = plt.bar(labels, ratios, width=0.6, color='skyblue', edgecolor='black', alpha=0.7)
+            
+        #     # 在每个柱子上方添加数值标签
+        #     for bar in bars:
+        #         height = bar.get_height()
+        #         plt.text(bar.get_x() + bar.get_width()/2., height,
+        #                  f'{height:.2f}',
+        #                  ha='center', va='bottom', fontsize=10)
+
+        #     plt.xlabel('Depth Interval (Upper Bound)')
+        #     plt.ylabel('Ratio (Probability)')
+        #     plt.title(f'Depth Histogram for View {v} (Sum={sum(ratios):.2f})')
+        #     plt.grid(axis='y', alpha=0.3, linestyle='--')
+        #     plt.ylim(0, 1.05) # 稍微留一点空间给标签
+
+        #     save_path = os.path.join(vis_dir, f'view_{v}_depth_distribution.png')
+        #     plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        #     print(f"Saved visualization to {save_path}")
+        #     plt.close()
+
         # Local Point Loss
-        point_loss, point_loss_details, scale = self.point_loss(pred, gt)
+        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized)
         final_loss += point_loss
         details.update(point_loss_details)
 
         # Camera Loss
-        camera_loss, camera_loss_details = self.camera_loss(pred, gt, scale)
+        camera_loss, camera_loss_details = self.camera_loss(pred_normalized, gt_normalized, scale)
         final_loss += camera_loss * 0.1
         details.update(camera_loss_details)
 

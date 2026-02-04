@@ -1,7 +1,7 @@
 # @package _global_
 
 model:
-    _target_: pi3.models.pi3_training.Pi3
+    _target_: pi3.models.pi3_training_sat.Pi3
     pos_type: rope100
     decoder_size: large
     load_vggt: false
@@ -22,9 +22,10 @@ loss:
         train_conf: false
 
 train:
+    # TODO: DEBUG CHANGE
     num_workers: 32 # debug use 0
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 270
+    num_epoch: 500
     iters_per_epoch: 75
 
     print_freq: 10
@@ -77,6 +78,7 @@ train:
         total_steps: -1
 
 test:
+    # TODO: DEBUG CHANGE
     num_workers: 32              # 16
     batch_size: 1              # not use, dynamic batch size
     print_freq: 10
