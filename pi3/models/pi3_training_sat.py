@@ -58,6 +58,10 @@ class Pi3(nn.Module):
         else:
             raise NotImplementedError
         
+        self.sat_to_embed = nn.Linear(3, self.encoder.embed_dim)
+        nn.init.constant_(self.sat_to_embed.weight, 0)
+        nn.init.constant_(self.sat_to_embed.bias, 0)
+        self.register_buffer('sat_physical_range', torch.tensor(140.0))
 
         # ----------------------
         #        Decoder
@@ -339,6 +343,30 @@ class Pi3(nn.Module):
 
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
+
+        # ==========================================================
+        # [新增] 在这里注入卫星位置编码
+        # ==========================================================
+        # hidden 目前是 (B*N, L, D)，我们需要把它拆开成 (B, N, L, D)
+        hidden = hidden.reshape(B, N, patch_h * patch_w, -1)
+        # 取出卫星图特征 (View 0)
+        sat_feat = hidden[:, 0] # (B, L, D)
+        
+        # 准备位置编码
+        y_steps = torch.linspace(-1, 1, patch_h, device=sat_feat.device, dtype=sat_feat.dtype)
+        x_steps = torch.linspace(-1, 1, patch_w, device=sat_feat.device, dtype=sat_feat.dtype)
+        grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
+        scale_map = torch.full_like(grid_x, self.sat_physical_range)
+        pos_input = torch.stack([grid_x, grid_y, scale_map], dim=-1)
+        pos_embed = self.sat_to_embed(pos_input)
+        pos_embed = pos_embed.unsqueeze(0).expand(B, -1, -1, -1)
+
+        # 这就是注入过程。卫星图的特征现在包含了特定的位置信息。
+        sat_feat = sat_feat + pos_embed.reshape(B, patch_h*patch_w, -1)
+        
+        # 放回去并恢复形状给 self.decode 使用
+        hidden[:, 0] = sat_feat
+        hidden = hidden.reshape(B*N, patch_h * patch_w, -1)
 
         hidden, pos = self.decode(hidden, N, H, W)
 

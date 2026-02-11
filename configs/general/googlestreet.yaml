@@ -1,6 +1,6 @@
 # @package _global_
 
-name: 'pi3_init_megadepthsat_refineloss+decoderplus+sattoken+pos'
+name: 'googlestreet'
 working_dir: ${work_dir}
 random_seed: 1111
 

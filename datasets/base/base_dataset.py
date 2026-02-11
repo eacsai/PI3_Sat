@@ -1,5 +1,5 @@
 from datasets.base.easy_dataset import EasyDataset
-from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates
+from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates, homogenize_points, se3_inverse
 import numpy as np
 import os
 import PIL
@@ -9,6 +9,9 @@ from omegaconf import OmegaConf
 from .transforms import *
 import pandas as pd
 from .utils import *
+
+import plyfile
+from plyfile import PlyData, PlyElement
 
 class BaseDataset(EasyDataset):
     def __init__(
@@ -252,6 +255,64 @@ class BaseDataset(EasyDataset):
 
                 # if overlap is False:
                 #     raise ValueError("Views are not overlapped!")
+
+                # all_pts = []
+                # all_colors = []
+                
+                # for i, view in enumerate(views):
+                #     # pts3d is (H, W, 3)
+                #     pts = view['pts3d']
+                #     mask = view['valid_mask']
+                    
+                #     # Image is usually (3, H, W) after ToTensor transform and normalized [0,1]
+                #     # We need to un-normalize to [0, 255] and reshape
+                #     img_tensor = view['img']
+                #     if img_tensor.ndim == 3: # C, H, W
+                #         img_np = img_tensor.permute(1, 2, 0).numpy()
+                #     else:
+                #         img_np = np.array(img_tensor)
+                        
+                #     # Scale to 0-255 for ply colors
+                #     if img_np.max() <= 1.0:
+                #         img_np = (img_np * 255).astype(np.uint8)
+                #     else:
+                #         img_np = img_np.astype(np.uint8)
+
+                #     # Flatten based on mask
+                #     pts_masked = pts[mask]
+                #     colors_masked = img_np[mask]
+
+                #     # Apply camera pose if available to align point clouds in world space
+                #     # If camera_pose is all NaN or Identity, this keeps it in camera space
+                #     # transform to first frame camera coordinate
+                #     pose = views[0].get('camera_pose', np.eye(4))
+                #     w2c_target = se3_inverse(pose[None]) # (4, 4)
+                #     w2c_target = torch.from_numpy(w2c_target).float()
+                #     pts_masked = torch.einsum('bij, bnj -> bni', w2c_target, homogenize_points(torch.from_numpy(pts_masked[None]).float()))[..., :3].squeeze(0) # (N, 3)
+
+                #     all_pts.append(pts_masked.numpy())
+                #     all_colors.append(colors_masked)
+
+                # # Concatenate all views
+                # full_pts = np.concatenate(all_pts, axis=0)
+                # full_colors = np.concatenate(all_colors, axis=0)
+
+                # # Create structured array for PLY writing
+                # vertex = np.zeros(full_pts.shape[0], dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), 
+                #                                             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')])
+                
+                # vertex['x'] = full_pts[:, 0]
+                # vertex['y'] = full_pts[:, 1]
+                # vertex['z'] = full_pts[:, 2]
+                # vertex['red'] = full_colors[:, 0]
+                # vertex['green'] = full_colors[:, 1]
+                # vertex['blue'] = full_colors[:, 2]
+
+                # # Save to current directory
+                # ply_filename = "data/vis_ply/basedata_points.ply"
+                # el = PlyElement.describe(vertex, 'vertex')
+                # PlyData([el]).write(ply_filename)
+                # print(f"[DEBUG] Saved point cloud to {os.path.abspath(ply_filename)} with {len(full_pts)} points")
 
             except Exception as e:
                 views = None

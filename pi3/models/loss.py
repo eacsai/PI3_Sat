@@ -385,7 +385,7 @@ class Pi3Loss(nn.Module):
         return pred
 
     def forward(self, pred, gt_raw):
-        if 'megadepthsat' in gt_raw[0]['dataset']:
+        if 'megadepthsat' or 'googlestreet' in gt_raw[0]['dataset']:
             # For Grd and Drone Views
             gt_normalized = self.prepare_gt(gt_raw, sat_height=gt_raw[0]['sat_height'][0]-gt_raw[0]['sat_gap'][0])
         else:
