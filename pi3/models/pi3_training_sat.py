@@ -11,6 +11,7 @@ from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextTransformerDecoder
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
+from .sat_position import FourierEmbedder
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
 
@@ -58,9 +59,12 @@ class Pi3(nn.Module):
         else:
             raise NotImplementedError
         
-        self.sat_to_embed = nn.Linear(3, self.encoder.embed_dim)
-        nn.init.constant_(self.sat_to_embed.weight, 0)
-        nn.init.constant_(self.sat_to_embed.bias, 0)
+        self.sat_pos_embedder = FourierEmbedder(
+            in_dim=2, 
+            embed_dim=self.encoder.embed_dim, 
+            num_freqs=64, 
+            scale=10.0 
+        )
         self.register_buffer('sat_physical_range', torch.tensor(140.0))
 
         # ----------------------
@@ -356,13 +360,14 @@ class Pi3(nn.Module):
         y_steps = torch.linspace(-1, 1, patch_h, device=sat_feat.device, dtype=sat_feat.dtype)
         x_steps = torch.linspace(-1, 1, patch_w, device=sat_feat.device, dtype=sat_feat.dtype)
         grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
-        scale_map = torch.full_like(grid_x, self.sat_physical_range)
-        pos_input = torch.stack([grid_x, grid_y, scale_map], dim=-1)
-        pos_embed = self.sat_to_embed(pos_input)
-        pos_embed = pos_embed.unsqueeze(0).expand(B, -1, -1, -1)
-
-        # 这就是注入过程。卫星图的特征现在包含了特定的位置信息。
-        sat_feat = sat_feat + pos_embed.reshape(B, patch_h*patch_w, -1)
+        # scale_map = torch.full_like(grid_x, self.sat_physical_range)
+        pos_input = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
+        # 使用 Fourier Embedder
+        # (B, H, W, 2) -> (B, H, W, D) -> (B, L, D)
+        pos_embed = self.sat_pos_embedder(pos_input.unsqueeze(0).expand(B, -1, -1, -1))
+        pos_embed = pos_embed.reshape(B, patch_h * patch_w, -1)
+        # 注入位置信息
+        sat_feat = sat_feat + pos_embed
         
         # 放回去并恢复形状给 self.decode 使用
         hidden[:, 0] = sat_feat

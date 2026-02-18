@@ -379,7 +379,7 @@ class Pi3Loss(nn.Module):
         # 可视化保存点云（将 local_points 转换到世界坐标系）
         if self.save_vis:
             # local_points -> world_points: 使用 camera_poses_normalized 进行变换
-            pred_global_from_local = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses_normalized, homogenize_points(local_points))[..., :3]
+            pred_global_from_local = pred['points']
             self.save_point_cloud_vis(pred_global_from_local, masks, gt['imgs'], prefix='pred_global')
 
         return pred

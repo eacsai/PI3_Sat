@@ -1,14 +1,16 @@
 # @package _global_
 
 train_dataset:
-    length: 2500         # dummy
+    length: 5000         # dummy
 
     weights: 
-        GoogleStreet: 2500
+        GoogleStreet: 5000
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
-        data_root: /data/zhongyao/dataset/0005_pair/0005_70_30 # 修改为你的 MegaDepth 数据集路径
+        data_root: /data/zhongyao/dataset/ # 修改为你的 MegaDepth 数据集路径
+        split: True
+        shift_range: 20
         z_far: 30000
         frame_num: 3
         aug_crop: 16
@@ -25,11 +27,13 @@ train_dataloader:
 
 test_dataset:
     weights: 
-        GoogleStreet: 400
+        GoogleStreet: 5000
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
-        data_root: /data/zhongyao/dataset/0005_pair/0005_70_30  # 修改为你的 MegaDepth 数据集路径
+        data_root: /data/zhongyao/dataset/  # 修改为你的 MegaDepth 数据集路径
+        split: True
+        shift_range: 20
         z_far: 30000
         frame_num: 3
         resolution:

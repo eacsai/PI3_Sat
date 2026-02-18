@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - model: pi3_megadepthsat.yaml
+  - model: pi3_googlestreet.yaml
   - train: train_pi3_lowres_megadepth
   - data: googlestreet.yaml
   - general: googlestreet.yaml
