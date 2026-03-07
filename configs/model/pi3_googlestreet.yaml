@@ -23,10 +23,10 @@ loss:
 
 train:
     # TODO: DEBUG CHANGE
-    num_workers: 32 # debug use 0
+    num_workers: 4 # debug use 0
     batch_size: 1              # not use, dynamic batch size
     num_epoch: 500
-    iters_per_epoch: 220
+    iters_per_epoch: 770
 
     print_freq: 10
     base_seed: 666
@@ -79,7 +79,7 @@ train:
 
 test:
     # TODO: DEBUG CHANGE
-    num_workers: 32              # 16
+    num_workers: 4              # 16
     batch_size: 1              # not use, dynamic batch size
     print_freq: 10
     iters_per_test: -1

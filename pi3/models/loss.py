@@ -318,6 +318,8 @@ class Pi3Loss(nn.Module):
         # transform to first frame camera coordinate
         w2c_target = se3_inverse(poses[:, 0])
         gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
+        # TODO: 这里只有当卫星图在第一张且只有一张卫星图的时候可以work，还需要优化
+        # gt_pts[:, 0, :, :, 2].clamp_(min=0)
         poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
 
         # normalize points

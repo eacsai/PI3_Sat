@@ -1,7 +1,9 @@
+from typing import Any
 import torch
 import torch.nn as nn
 from functools import partial
 from copy import deepcopy
+from einops import rearrange
 
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points
@@ -14,6 +16,8 @@ from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from .sat_position import FourierEmbedder
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
+from .query import DecoderBlock, PatchEmbeddingFast
+
 
 def freeze_all_params(modules):
     for module in modules:
@@ -105,6 +109,19 @@ class Pi3(nn.Module):
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
 
+
+        # ----------------------
+        #     Query Decoder
+        # ----------------------
+        self.query_pos_embedder = FourierEmbedder(in_dim=2, embed_dim=dec_embed_dim, num_freqs=64, scale=10.0)
+        self.query_decoder = nn.ModuleList([
+            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0)
+            for _ in range(8)
+        ])
+        self.query_norm = nn.LayerNorm(dec_embed_dim)
+        self.patch_embed = PatchEmbeddingFast(patch_size=9, embed_dim=dec_embed_dim)
+        self.query_token = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
+
         # ----------------------
         #     Register_token
         # ----------------------
@@ -116,23 +133,11 @@ class Pi3(nn.Module):
         # ----------------------
         #  Local Points Decoder
         # ----------------------
-        self.point_decoder = TransformerDecoder(
-            in_dim=2*self.dec_embed_dim, 
-            dec_embed_dim=1024,
-            dec_num_heads=16,
-            out_dim=1024,
-            rope=self.rope,
+        self.query_point_head = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.Linear(512, 3)
         )
-        self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
-
-        self.sat_point_decoder = TransformerDecoder(
-            in_dim=2*self.dec_embed_dim, 
-            dec_embed_dim=1024,
-            dec_num_heads=16,
-            out_dim=1024,
-            rope=self.rope,
-        )
-        self.sat_point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
 
         # ----------------------
         #  Camera Pose Decoder
@@ -146,7 +151,6 @@ class Pi3(nn.Module):
             use_checkpoint=False
         )
         self.camera_head = CameraHead(dim=512)
-        
 
         # ----------------------
         #  Global Points Decoder
@@ -232,41 +236,6 @@ class Pi3(nn.Module):
                     print(f"[Pi3] Expanding register_token from {reg_token.shape} to {self.register_token.shape}")
                     # 在第1维复制一份：view0 和 view1 初始权重相同
                     pi3_weight['register_token'] = reg_token.repeat(1, 2, 1, 1)
-
-            # -------------------------------------------------------
-            # 2.  [新增] 手动克隆权重给 Satellite 模块
-            # -------------------------------------------------------
-            new_keys = {}
-            for k, v in pi3_weight.items():
-                # 1. 复制 point_decoder -> sat_point_decoder
-                if k.startswith('point_decoder.'):
-                    new_k = k.replace('point_decoder.', 'sat_point_decoder.')
-                    new_keys[new_k] = v
-                
-                # 2. 复制 point_head -> sat_point_head
-                # elif k.startswith('point_head.'):
-                #     new_k = k.replace('point_head.', 'sat_point_head.')
-                #     new_keys[new_k] = v
-                
-                # 3. 复制 conf_decoder -> sat_conf_decoder (如果有的话)
-                elif k.startswith('conf_decoder.'):
-                    new_k = k.replace('conf_decoder.', 'sat_conf_decoder.')
-                    new_keys[new_k] = v
-                
-                # 4. 复制 conf_head -> sat_conf_head (如果有的话)
-                elif k.startswith('conf_head.'):
-                    new_k = k.replace('conf_head.', 'sat_conf_head.')
-                    new_keys[new_k] = v
-            
-            # 将复制出来的新权重合并回原来的字典中
-            if len(new_keys) > 0:
-                print(f"[Pi3] Duplicating {len(new_keys)} keys for satellite components initialization.")
-                pi3_weight.update(new_keys)
-
-            # 这能保证网络一开始输出的卫星图局部点云趋近于 0，防止刚开始训练时初始 loss 爆炸
-            for m in self.sat_point_head.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, std=0.01) # 极小的方差
 
             print("Loading pi3 weights", self.load_state_dict(pi3_weight, strict=False))
 
@@ -357,7 +326,7 @@ class Pi3(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs):
+    def forward(self, imgs, queries=None, t_src=None): # [关键修改] 加入 queries 参数
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -365,8 +334,8 @@ class Pi3(nn.Module):
         patch_h, patch_w = H // 14, W // 14
         
         # encode by dinov2
-        imgs = imgs.reshape(B*N, _, H, W)
-        hidden = self.encoder(imgs, is_training=True)
+        frames = imgs.reshape(B*N, _, H, W)
+        hidden = self.encoder(frames, is_training=True)
 
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
@@ -379,38 +348,55 @@ class Pi3(nn.Module):
         grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
         
         pos_input = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
-        pos_embed = self.sat_pos_embedder(pos_input.unsqueeze(0).expand(B, -1, -1, -1))
+        sat_pos_embed = self.sat_pos_embedder(pos_input.unsqueeze(0).expand(B, -1, -1, -1))
         
         # 保存下来供 decode 循环使用
-        sat_pos_embed = pos_embed.reshape(B, patch_h * patch_w, -1)
+        sat_pos_embed = sat_pos_embed.reshape(B, patch_h * patch_w, -1)
         # 将 sat_pos_embed 传给 decode
         hidden, pos = self.decode(hidden, N, H, W, sat_pos_embed)
 
         # ==========================================================
-        # 2. 准备特征供下游 Decoder 使用
+        # 2. 生成/处理 Queries (u, v)，形状为(B, N*Num_queries, 2)
         # ==========================================================
-        hw_total = patch_h * patch_w + self.patch_start_idx
-        BN_hidden = hidden.reshape(B, N, hw_total, -1)
-        BN_pos = pos.reshape(B, N, hw_total, -1)
+        if queries is None:
+            # [关键修改] 如果没有提供 Query，我们应该直接生成原图分辨率 (H, W) 的查询，
+            # 而不是 patch 分辨率！这就是 Query 机制“任意分辨率”的威力。
+            y_steps = torch.linspace(0, 1, 64, device=hidden.device, dtype=hidden.dtype)
+            x_steps = torch.linspace(0, 1, 64, device=hidden.device, dtype=hidden.dtype)
+            grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
+            dense_queries = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
+            queries = dense_queries.view(1, -1, 2).expand(B * N, -1, -1) # [B * N, Num_queries, 2]
+            queries = rearrange(queries, '(b n) q c -> b (n q) c', b=B, n=N) # (B, N, Num_queries, 2) -> (B, N*Num_queries, 2)
+        else:
+            # 如果训练时传入了稀疏 Query (比如随机抽 2048 个点)，将其展平
+            queries = queries.reshape(B, -1, 2)
+            
+        num_queries = queries.shape[1] # 记录当前查询的点的数量
 
-        # 拆分特征
-        sat_hidden = BN_hidden[:, 0]     # 直接使用提纯后的特征，不再叠加绝对坐标！
-        sat_pos = BN_pos[:, 0]
-        
-        gd_hidden = BN_hidden[:, 1:]     # (B, N-1, tokens, dim)
-        gd_pos = BN_pos[:, 1:]
+        # ==========================================================
+        # 3. D4RT 核心：交叉注意力查询 (Cross-Attention Decoding)
+        # ==========================================================
+        # 3.1 傅里叶编码 Query 坐标
+        query_pos_embeddings = self.query_pos_embedder(queries) # (B, N*Num_queries, 2)
 
-        # ==========================================================
-        # 3. 拆分 Satellite (View 0) 和 Ground (View 1:)
-        # ==========================================================
-        sat_point_hidden = self.sat_point_decoder(sat_hidden, xpos=sat_pos) # (B, tokens, dim)
-        gd_hidden_flat = gd_hidden.reshape(B*(N-1), patch_h*patch_w+self.patch_start_idx, -1) # (B*(N-1), tokens, dim)
-        gd_pos_flat = gd_pos.reshape(B*(N-1), patch_h*patch_w+self.patch_start_idx, -1) # (B*(N-1), tokens, dim)
-        gd_point_hidden = self.point_decoder(gd_hidden_flat, xpos=gd_pos_flat) # (B*(N-1), tokens, dim)
+        # 3.2 Local RGB patch embedding
+        if imgs.dim() == 5 and imgs.shape[-1] == 3:
+            imgs = imgs.permute(0, 1, 4, 2, 3)  # (B, N, H, W, C) -> (B, N, C, H, W)
+        if t_src is None:            
+            t_src = torch.arange(N, device=imgs.device).view(1, N, 1).expand(B, N, num_queries // N)
+            t_src = rearrange(t_src, 'b n q -> b (n q)')
+
+        patch_rgb_embeddings = self.patch_embed(imgs, queries, t_src)  # (B, N*Num_queries, embed_dim)
+        query_embeddings = query_pos_embeddings + patch_rgb_embeddings + self.query_token.expand(B, num_queries, -1)
+        query_hidden = rearrange(hidden, '(b n) q c -> b (n q) c', n=N)
+
+        # 3.3 让 Query 去图像特征 (hidden) 中提取信息
+        for block in self.query_decoder:
+            query_embeddings = block(query_embeddings, query_hidden)
+        point_hidden = self.query_norm(query_embeddings)
 
         if self.train_conf:
-            sat_conf_hidden = self.sat_conf_decoder(sat_hidden, xpos=sat_pos) # (B, tokens, dim)
-            gd_conf_hidden = self.conf_decoder(gd_hidden_flat, xpos=gd_pos_flat) # (B*(N-1), tokens, dim)
+            conf_hidden = self.conf_decoder(hidden, xpos=pos)
 
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         if self.use_global_points:
@@ -418,24 +404,17 @@ class Pi3(nn.Module):
             global_point_hidden = self.global_points_decoder(hidden, context, xpos=pos, ypos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # TODO: 对于卫星图，不需要预测深度的对数，也不要把xy*z，而是直接预测x,y,z
-            # sat local points
-            sat_point_hidden = sat_point_hidden.float()
-            sat_local_points = self.sat_point_head([sat_point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, 1, H, W, -1)
-            # grd and drone local points
-            gd_point_hidden = gd_point_hidden.float()
-            gd_ret = self.point_head([gd_point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N-1, H, W, -1)
-            gd_xy, gd_z = gd_ret.split([2, 1], dim=-1)
-            gd_z = torch.exp(gd_z)
-            gd_local_points = torch.cat([gd_xy * gd_z, gd_z], dim=-1)
-            local_points = torch.cat([sat_local_points, gd_local_points], dim=1)
+            # local points
+            point_hidden = point_hidden.float()
+            ret = self.query_point_head(point_hidden).reshape(B, N, H, W, -1)
+            xy, z = ret.split([2, 1], dim=-1)
+            z = torch.exp(z)
+            local_points = torch.cat([xy * z, z], dim=-1)
+
             # confidence
             if self.train_conf:
-                sat_conf_hidden = sat_conf_hidden.float()
-                sat_conf = self.sat_conf_head([sat_conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, 1, H, W, -1)
-                gd_conf_hidden = gd_conf_hidden.float()
-                gd_conf = self.conf_head([gd_conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N-1, H, W, -1)
-                conf = torch.cat([sat_conf, gd_conf], dim=1)
+                conf_hidden = conf_hidden.float()
+                conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
             else:
                 conf = None
                 
@@ -446,12 +425,12 @@ class Pi3(nn.Module):
             # ==========================================================
             # [New] 强制将卫星图 (View 0) 的相机位姿设为单位矩阵！
             # ==========================================================
-            # # 生成形状为 (B, 1, 4, 4) 的单位矩阵
-            # identity_pose = torch.eye(4, device=camera_poses.device, dtype=camera_poses.dtype)
-            # identity_pose = identity_pose.view(1, 1, 4, 4).expand(B, 1, -1, -1)
+            # 生成形状为 (B, 1, 4, 4) 的单位矩阵
+            identity_pose = torch.eye(4, device=camera_poses.device, dtype=camera_poses.dtype)
+            identity_pose = identity_pose.view(1, 1, 4, 4).expand(B, 1, -1, -1)
             
-            # # 把常数单位矩阵(View 0) 和 网络预测的其他位姿(View 1:) 拼起来
-            # camera_poses_fixed = torch.cat([identity_pose, camera_poses[:, 1:]], dim=1)
+            # 把常数单位矩阵(View 0) 和 网络预测的其他位姿(View 1:) 拼起来
+            camera_poses_fixed = torch.cat([identity_pose, camera_poses[:, 1:]], dim=1)
 
             # Global points
             if self.use_global_points:
@@ -461,12 +440,12 @@ class Pi3(nn.Module):
                 global_points = None
             
             # unproject local points using camera poses
-            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses_fixed, homogenize_points(local_points))[..., :3]
 
-        return dict(
+        return dict[str, Any | None](
             points=points,
             local_points=local_points,
             conf=conf,
-            camera_poses=camera_poses,
+            camera_poses=camera_poses_fixed,
             global_points=global_points
         )
