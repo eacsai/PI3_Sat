@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class FourierEmbedder(nn.Module):
-    def __init__(self, in_dim=2, embed_dim=1024, num_freqs=64, scale=10.0, include_input=True):
+    def __init__(self, in_dim=2, embed_dim=1024, num_freqs=64, scale=10.0, include_input=True, zero_init=True):
         super().__init__()
         self.include_input = include_input
         self.num_freqs = num_freqs
@@ -20,8 +20,12 @@ class FourierEmbedder(nn.Module):
         
         # 保持你原始代码的 Zero-init 策略
         # 这样在训练开始时，位置编码产生的扰动为 0，不会破坏预训练特征
-        nn.init.constant_(self.proj.weight, 0)
-        nn.init.constant_(self.proj.bias, 0)
+        if zero_init:
+            nn.init.constant_(self.proj.weight, 0)
+            nn.init.constant_(self.proj.bias, 0)
+        else:
+            nn.init.normal_(self.proj.weight, std=0.02)
+            nn.init.normal_(self.proj.bias, std=0.02)
 
     def forward(self, x):
         # x: [Batch, ..., 2] (normalized coords)

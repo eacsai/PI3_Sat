@@ -279,64 +279,49 @@ class PatchEmbeddingFast(nn.Module):
     def forward(
         self,
         frames: torch.Tensor,
-        coords: torch.Tensor,
-        t_src: torch.Tensor
+        coords: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
             frames: (B, T, C, H, W) video frames
-            coords: (B, N, 2) normalized coordinates in [0, 1]
-            t_src: (B, N) source frame indices
+            coords: (B*T, N, 2) normalized coordinates in [0, 1]
 
         Returns:
-            embeddings: (B, N, embed_dim)
+            embeddings: (B*T, N, embed_dim)
         """
         B, T, C, H, W = frames.shape
+        frames = frames.reshape(B * T, C, H, W)
         N = coords.shape[1]
         ps = self.patch_size
 
-        # Gather frames for each query
-        # t_src: (B, N) -> expand for gathering
-        t_src_expanded = t_src.view(B, N, 1, 1, 1).expand(-1, -1, C, H, W)
-
-        # Create batch indices
-        batch_frames = []
-        for b in range(B):
-            query_frames = frames[b, t_src[b]]  # (N, C, H, W)
-            batch_frames.append(query_frames)
-        query_frames = torch.stack(batch_frames, dim=0)  # (B, N, C, H, W)
-
-        # Reshape for grid_sample: (B*N, C, H, W)
-        query_frames = query_frames.view(B * N, C, H, W)
-
-        # Create sampling grid
-        # coords: (B, N, 2) -> pixel offsets
+        # 1. 直接计算像素网格坐标
         coords_pixel = coords.clone()
         coords_pixel[..., 0] = coords_pixel[..., 0] * (W - 1)
         coords_pixel[..., 1] = coords_pixel[..., 1] * (H - 1)
 
-        # Add offsets for patch: (B, N, ps, ps, 2)
-        grid = coords_pixel.view(B, N, 1, 1, 2) + self.offsets.view(1, 1, ps, ps, 2)
+        # 2. 加上偏移量: (B*T, N, 1, 1, 2) + (1, 1, ps, ps, 2) -> (B*T, N, ps, ps, 2)
+        grid = coords_pixel.view(B * T, N, 1, 1, 2) + self.offsets.view(1, 1, ps, ps, 2)
 
-        # Normalize to [-1, 1] for grid_sample
+        # 3. 归一化到 [-1, 1]
         grid[..., 0] = 2.0 * grid[..., 0] / (W - 1) - 1.0
         grid[..., 1] = 2.0 * grid[..., 1] / (H - 1) - 1.0
 
-        # Reshape grid: (B*N, ps, ps, 2)
-        grid = grid.view(B * N, ps, ps, 2)
+        # 【核心修正】：巧妙变形 grid 而不复制 frames！
+        # 将 grid 变为 (B_T, N * ps, ps, 2)，这样 grid_sample 会把它当成一张极高的"瘦长"图来采
+        grid = grid.view(B * T, N * ps, ps, 2)
 
-        # Sample patches
+        # 4. 执行极速采样 (完全不占用额外显存)
         patches = F.grid_sample(
-            query_frames, grid,
+            frames, grid,
             mode='bilinear',
             padding_mode='border',
             align_corners=True
-        )  # (B*N, C, ps, ps)
+        )  # 结果为 (B*T, C, N * ps, ps)
 
-        # Reshape and permute
-        patches = patches.view(B, N, C, ps, ps)
-        patches = patches.permute(0, 1, 3, 4, 2)  # (B, N, ps, ps, C)
+        # 5. 变回我们需要的形状
+        patches = patches.view(B * T, C, N, ps, ps)
+        patches = patches.permute(0, 2, 3, 4, 1)  # (B*T, N, ps, ps, C)
 
-        # Flatten and embed
-        patches_flat = patches.reshape(B, N, -1)
+        # 6. 展平和 MLP 编码
+        patches_flat = patches.reshape(B * T, N, -1)
         return self.mlp(patches_flat)

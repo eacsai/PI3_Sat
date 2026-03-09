@@ -2,7 +2,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from functools import partial
-from copy import deepcopy
 from einops import rearrange
 
 from .dinov2.layers import Mlp
@@ -40,6 +39,7 @@ class Pi3(nn.Module):
             train_conf=False,
             num_dec_blk_not_to_checkpoint=4,
             ckpt=None,
+            default_query_count=1024,
         ):
         super().__init__()
 
@@ -67,7 +67,7 @@ class Pi3(nn.Module):
             in_dim=2, 
             embed_dim=self.encoder.embed_dim, 
             num_freqs=64, 
-            scale=10.0 
+            scale=1.5 
         )
 
         # ----------------------
@@ -113,7 +113,15 @@ class Pi3(nn.Module):
         # ----------------------
         #     Query Decoder
         # ----------------------
-        self.query_pos_embedder = FourierEmbedder(in_dim=2, embed_dim=dec_embed_dim, num_freqs=64, scale=10.0)
+        self.query_hidden_project = nn.Linear(dec_embed_dim*2, dec_embed_dim)
+        self.query_pos_embedder = FourierEmbedder(
+            in_dim=2, 
+            embed_dim=dec_embed_dim, 
+            num_freqs=64, 
+            scale=30.0, 
+            include_input=False,
+            zero_init=False
+        )
         self.query_decoder = nn.ModuleList([
             DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0)
             for _ in range(8)
@@ -121,6 +129,7 @@ class Pi3(nn.Module):
         self.query_norm = nn.LayerNorm(dec_embed_dim)
         self.patch_embed = PatchEmbeddingFast(patch_size=9, embed_dim=dec_embed_dim)
         self.query_token = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
+        self.default_query_count = default_query_count
 
         # ----------------------
         #     Register_token
@@ -134,7 +143,7 @@ class Pi3(nn.Module):
         #  Local Points Decoder
         # ----------------------
         self.query_point_head = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(dec_embed_dim, 512),
             nn.GELU(),
             nn.Linear(512, 3)
         )
@@ -195,18 +204,19 @@ class Pi3(nn.Module):
             print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
 
         self.train_conf = train_conf
-        # ----------------------
-        #     Conf Decoder
-        # ----------------------
-        self.conf_decoder = deepcopy(self.point_decoder)
-        self.conf_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=1)
-        self.sat_conf_decoder = deepcopy(self.sat_point_decoder)
-        self.sat_conf_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=1)
-
-        if train_conf:
-            freeze_all_params([self.encoder, self.decoder, self.point_decoder, self.point_head, self.sat_point_decoder, self.sat_point_head, self.camera_decoder,  self.camera_head, self.register_token])
-        if use_global_points:
-            freeze_all_params([self.global_points_decoder, self.global_point_head])
+        if self.train_conf:
+            self.conf_head = nn.Sequential(
+                nn.Linear(self.dec_embed_dim, 512),
+                nn.GELU(),
+                nn.Linear(512, 1)
+            )
+            freeze_all_params([
+                self.encoder, self.decoder, self.query_pos_embedder, self.query_decoder,
+                self.query_norm, self.patch_embed, self.query_token, self.query_point_head,
+                self.camera_decoder, self.camera_head, self.register_token
+            ])
+        else:
+            self.conf_head = None
 
         if freeze_encoder:
             print('Freezing the encoder.')
@@ -237,7 +247,10 @@ class Pi3(nn.Module):
                     # 在第1维复制一份：view0 和 view1 初始权重相同
                     pi3_weight['register_token'] = reg_token.repeat(1, 2, 1, 1)
 
-            print("Loading pi3 weights", self.load_state_dict(pi3_weight, strict=False))
+            res = self.load_state_dict(pi3_weight, strict=False)
+            print("Loading pi3 weights", res)
+            if res.unexpected_keys:
+                print("[Pi3] Unexpected keys (in ckpt but not in model):", res.unexpected_keys)
 
     def decode(self, hidden, N, H, W, sat_pos_embed=None):
         BN, hw, _ = hidden.shape
@@ -326,7 +339,7 @@ class Pi3(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs, queries=None, t_src=None): # [关键修改] 加入 queries 参数
+    def forward(self, imgs, queries=None): # [关键修改] 加入 queries 参数
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -359,45 +372,41 @@ class Pi3(nn.Module):
         # 2. 生成/处理 Queries (u, v)，形状为(B, N*Num_queries, 2)
         # ==========================================================
         if queries is None:
-            # [关键修改] 如果没有提供 Query，我们应该直接生成原图分辨率 (H, W) 的查询，
-            # 而不是 patch 分辨率！这就是 Query 机制“任意分辨率”的威力。
-            y_steps = torch.linspace(0, 1, 64, device=hidden.device, dtype=hidden.dtype)
-            x_steps = torch.linspace(0, 1, 64, device=hidden.device, dtype=hidden.dtype)
+            y_steps = torch.linspace(0, 1, H, device=hidden.device, dtype=hidden.dtype)
+            x_steps = torch.linspace(0, 1, W, device=hidden.device, dtype=hidden.dtype)
             grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
-            dense_queries = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
-            queries = dense_queries.view(1, -1, 2).expand(B * N, -1, -1) # [B * N, Num_queries, 2]
-            queries = rearrange(queries, '(b n) q c -> b (n q) c', b=B, n=N) # (B, N, Num_queries, 2) -> (B, N*Num_queries, 2)
-        else:
-            # 如果训练时传入了稀疏 Query (比如随机抽 2048 个点)，将其展平
-            queries = queries.reshape(B, -1, 2)
+            dense_queries = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+            query_per_view = min(self.default_query_count, dense_queries.shape[0])
             
-        num_queries = queries.shape[1] # 记录当前查询的点的数量
+            # 1. 生成形状为 (B*N, Total_Points) 的随机数矩阵
+            rand_matrix = torch.rand(B * N, dense_queries.shape[0], device=hidden.device)
+            # 2. 在第一维上排序，取前 query_per_view 个索引
+            idx = rand_matrix.argsort(dim=1)[:, :query_per_view]
+            # 3. 高级索引批量提取
+            queries = dense_queries[idx] # 输出形状直接是 (B*N, query_per_view, 2)
+        else:
+            queries = queries.reshape(B * N, -1, 2)
+
+        num_queries = queries.shape[1]
 
         # ==========================================================
         # 3. D4RT 核心：交叉注意力查询 (Cross-Attention Decoding)
         # ==========================================================
         # 3.1 傅里叶编码 Query 坐标
-        query_pos_embeddings = self.query_pos_embedder(queries) # (B, N*Num_queries, 2)
+        query_pos_embeddings = self.query_pos_embedder(queries * 2.0 - 1.0) # (B*N, Num_queries, 2)
 
         # 3.2 Local RGB patch embedding
         if imgs.dim() == 5 and imgs.shape[-1] == 3:
             imgs = imgs.permute(0, 1, 4, 2, 3)  # (B, N, H, W, C) -> (B, N, C, H, W)
-        if t_src is None:            
-            t_src = torch.arange(N, device=imgs.device).view(1, N, 1).expand(B, N, num_queries // N)
-            t_src = rearrange(t_src, 'b n q -> b (n q)')
 
-        patch_rgb_embeddings = self.patch_embed(imgs, queries, t_src)  # (B, N*Num_queries, embed_dim)
-        query_embeddings = query_pos_embeddings + patch_rgb_embeddings + self.query_token.expand(B, num_queries, -1)
-        query_hidden = rearrange(hidden, '(b n) q c -> b (n q) c', n=N)
+        patch_rgb_embeddings = self.patch_embed(imgs, queries)  # (B*N, Num_queries, embed_dim)
+        query_embeddings = query_pos_embeddings + patch_rgb_embeddings + self.query_token.expand(B*N, num_queries, -1)
+        query_hidden = self.query_hidden_project(hidden) # (B*N, grid_hw, embed_dim)
 
         # 3.3 让 Query 去图像特征 (hidden) 中提取信息
         for block in self.query_decoder:
-            query_embeddings = block(query_embeddings, query_hidden)
+            query_embeddings = block(query_embeddings, query_hidden[:, self.patch_start_idx:])
         point_hidden = self.query_norm(query_embeddings)
-
-        if self.train_conf:
-            conf_hidden = self.conf_decoder(hidden, xpos=pos)
-
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         if self.use_global_points:
             context = hidden.reshape(B, N, patch_h*patch_w+self.patch_start_idx, -1)[:, 0:1].repeat(1, N, 1, 1).reshape(B*N, patch_h*patch_w+self.patch_start_idx, -1)
@@ -406,15 +415,14 @@ class Pi3(nn.Module):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # local points
             point_hidden = point_hidden.float()
-            ret = self.query_point_head(point_hidden).reshape(B, N, H, W, -1)
+            ret = self.query_point_head(point_hidden).reshape(B, N, query_per_view, -1)
             xy, z = ret.split([2, 1], dim=-1)
             z = torch.exp(z)
             local_points = torch.cat([xy * z, z], dim=-1)
 
             # confidence
             if self.train_conf:
-                conf_hidden = conf_hidden.float()
-                conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                conf = self.conf_head(point_hidden).reshape(B, N, query_per_view, -1)
             else:
                 conf = None
                 
@@ -422,30 +430,14 @@ class Pi3(nn.Module):
             camera_hidden = camera_hidden.float()
             camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
 
-            # ==========================================================
-            # [New] 强制将卫星图 (View 0) 的相机位姿设为单位矩阵！
-            # ==========================================================
-            # 生成形状为 (B, 1, 4, 4) 的单位矩阵
-            identity_pose = torch.eye(4, device=camera_poses.device, dtype=camera_poses.dtype)
-            identity_pose = identity_pose.view(1, 1, 4, 4).expand(B, 1, -1, -1)
-            
-            # 把常数单位矩阵(View 0) 和 网络预测的其他位姿(View 1:) 拼起来
-            camera_poses_fixed = torch.cat([identity_pose, camera_poses[:, 1:]], dim=1)
-
-            # Global points
-            if self.use_global_points:
-                global_point_hidden = global_point_hidden.float()
-                global_points = self.global_point_head([global_point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-            else:
-                global_points = None
-            
             # unproject local points using camera poses
-            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses_fixed, homogenize_points(local_points))[..., :3]
+            points = torch.einsum('bnij, bnqj -> bnqi', camera_poses, homogenize_points(local_points))[..., :3]
 
         return dict[str, Any | None](
             points=points,
             local_points=local_points,
+            query_uv=queries.reshape(B, N, query_per_view, 2),
             conf=conf,
-            camera_poses=camera_poses_fixed,
-            global_points=global_points
+            camera_poses=camera_poses,
+            global_points=None
         )

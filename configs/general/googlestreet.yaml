@@ -1,6 +1,6 @@
 # @package _global_
 
-name: 'googlestreet'
+name: 'googlestreet_query'
 working_dir: ${work_dir}
 random_seed: 1111
 
