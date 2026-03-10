@@ -1,5 +1,5 @@
 from datasets.base.easy_dataset import EasyDataset
-from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates, homogenize_points, se3_inverse
+from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates, homogenize_points, se3_inverse, satellite_depthmap_to_absolute_camera_coordinates
 import numpy as np
 import os
 import PIL
@@ -223,7 +223,11 @@ class BaseDataset(EasyDataset):
                     assert 'valid_mask' not in view
                     assert np.isfinite(view['depthmap']).all(), f'NaN in depthmap for view {view_name(view)}'
                     view['z_far'] = self.z_far
-                    pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
+                    if 'satellite' in view['label']:
+                        pts3d, valid_mask = satellite_depthmap_to_absolute_camera_coordinates(**view)
+                        view['camera_pose'][1,3] = -view['sat_gap']
+                    else:
+                        pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
                     view['pts3d'] = pts3d
                     view['valid_mask'] = valid_mask & np.isfinite(pts3d).all(axis=-1)
@@ -256,6 +260,7 @@ class BaseDataset(EasyDataset):
                 # if overlap is False:
                 #     raise ValueError("Views are not overlapped!")
 
+                # # Visualize the point cloud
                 # all_pts = []
                 # all_colors = []
                 

@@ -259,7 +259,7 @@ class Pi3Loss(nn.Module):
         self.point_loss = PointLoss(train_conf=train_conf)
         self.camera_loss = CameraLoss()
 
-        self.save_vis = True
+        self.save_vis = save_vis
         self.save_vis_dir = save_vis_dir
         self.vis_call_count = 0
         if self.save_vis:
@@ -309,19 +309,15 @@ class Pi3Loss(nn.Module):
         filepath = os.path.join(self.save_vis_dir, filename)
         write_ply(merged_pts.cpu(), merged_rgb.cpu(), filepath)
 
-    def prepare_gt(self, gt, query_uv, sat_height=0.0, ):
+    def prepare_gt(self, gt, query_uv):
         gt_pts = torch.stack([view['pts3d'] for view in gt], dim=1)
         masks = torch.stack([view['valid_mask'] for view in gt], dim=1)
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
 
         B, N, H, W, _ = gt_pts.shape
-        if sat_height > 0.0:
-            poses[:, :1, 1, 3] += sat_height
         # transform to first frame camera coordinate
         w2c_target = se3_inverse(poses[:, 0])
         gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
-        # TODO: 这里只有当卫星图在第一张且只有一张卫星图的时候可以work，还需要优化
-        gt_pts[:, 0, :, :, 2].clamp_(min=0)
         poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
 
         # normalize points
@@ -444,7 +440,7 @@ class Pi3Loss(nn.Module):
         return pred
 
     def forward(self, pred, gt_raw):
-        gt_normalized = self.prepare_gt(gt_raw, query_uv=pred['query_uv'], sat_height=gt_raw[0]['sat_height'][0]-gt_raw[0]['sat_gap'][0])
+        gt_normalized = self.prepare_gt(gt_raw, query_uv=pred['query_uv'])
         pred_normalized = self.normalize_pred(pred, gt_normalized)
 
         final_loss = 0.0

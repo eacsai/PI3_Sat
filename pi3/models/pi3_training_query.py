@@ -39,7 +39,7 @@ class Pi3(nn.Module):
             train_conf=False,
             num_dec_blk_not_to_checkpoint=4,
             ckpt=None,
-            default_query_count=1024,
+            default_query_count=112 * 112,
         ):
         super().__init__()
 
@@ -124,12 +124,12 @@ class Pi3(nn.Module):
         )
         self.query_decoder = nn.ModuleList([
             DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0)
-            for _ in range(8)
+            for _ in range(4)
         ])
         self.query_norm = nn.LayerNorm(dec_embed_dim)
         self.patch_embed = PatchEmbeddingFast(patch_size=9, embed_dim=dec_embed_dim)
         self.query_token = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
-        self.default_query_count = default_query_count
+        self.default_query_count = int(default_query_count)
 
         # ----------------------
         #     Register_token

@@ -5,7 +5,7 @@ trainer: trainers.pi3_trainer.Pi3Trainer
 train:
   image_num_range: [3, 3]     # hres
   # TODO: DEBUG CHANGE
-  max_img_per_gpu: 64             # hres
+  max_img_per_gpu: 16             # hres
 
   # low resolution
   resolution: 

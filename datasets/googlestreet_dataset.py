@@ -100,7 +100,7 @@ class GoogleStreetDataset(BaseDataset):
         self.file_paths = get_sorted_pair_paths(data_root, split=self.split, mode=mode)
         self.shift_range = shift_range 
         self.sat_height = 5726
-        self.sat_gap = 200
+        self.sat_gap = 120
 
     def __len__(self):
         return len(self.file_paths)
@@ -214,16 +214,21 @@ class GoogleStreetDataset(BaseDataset):
             rgb, depth, K = self._crop_resize_if_necessary(
                 rgb, depth, K, resolution, rng=rng, info=folder_path)
 
+            # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
+            # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。
+            if "satellite" in prefix:
+                tmp_sat_height = -c2w[1,3]
+                depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
+
             views.append(dict(
                 img=rgb,
                 depthmap=depth.astype(np.float32),
                 camera_pose=c2w.astype(np.float32),
                 camera_intrinsics=K.astype(np.float32),
+                sat_gap=self.sat_gap,
                 dataset=self.dataset_label,
                 label=f'mega_depth_{prefix}_{index}',
                 instance=str(prefix + '_' + str(index)),
-                sat_height=self.sat_height,
-                sat_gap=self.sat_gap,
                 sat_meters=current_sat_meters,
                 sat_shift_east=shift_east if "satellite" in prefix else 0,
                 sat_shift_south=shift_south if "satellite" in prefix else 0
