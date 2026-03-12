@@ -4,10 +4,61 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+class ContinuousRoPE2D(nn.Module):
+    """RoPE2D for continuous (float) 2D positions.
+
+    Standard RoPE2D (pos_embed.py) requires integer grid positions via F.embedding.
+    This variant computes rotary embeddings directly from continuous (y, x)
+    coordinates, making it suitable for query points at arbitrary positions.
+
+    Interface matches RoPE2D: forward(tokens, positions)
+        tokens:    (B, num_heads, N, head_dim)
+        positions: (B, N, 2)  — continuous (y, x)
+    """
+
+    def __init__(self, freq: float = 100.0):
+        super().__init__()
+        self.base = freq
+
+    @staticmethod
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        assert tokens.size(3) % 2 == 0
+        D = tokens.size(3) // 2
+
+        inv_freq = 1.0 / (self.base ** (
+            torch.arange(0, D, 2, device=tokens.device).float() / D
+        ))
+
+        pos_y = positions[..., 0].float()
+        pos_x = positions[..., 1].float()
+
+        freqs_y = torch.einsum('bn,d->bnd', pos_y, inv_freq)
+        freqs_x = torch.einsum('bn,d->bnd', pos_x, inv_freq)
+
+        freqs_y = torch.cat([freqs_y, freqs_y], dim=-1).to(tokens.dtype)
+        freqs_x = torch.cat([freqs_x, freqs_x], dim=-1).to(tokens.dtype)
+
+        cos_y = freqs_y.cos().unsqueeze(1)
+        sin_y = freqs_y.sin().unsqueeze(1)
+        cos_x = freqs_x.cos().unsqueeze(1)
+        sin_x = freqs_x.sin().unsqueeze(1)
+
+        t_y, t_x = tokens.chunk(2, dim=-1)
+        t_y = t_y * cos_y + ContinuousRoPE2D.rotate_half(t_y) * sin_y
+        t_x = t_x * cos_x + ContinuousRoPE2D.rotate_half(t_x) * sin_x
+
+        return torch.cat([t_y, t_x], dim=-1)
+
+
 class CrossAttention(nn.Module):
     """Efficient cross-attention using PyTorch's scaled_dot_product_attention.
 
     Automatically uses FlashAttention or memory-efficient attention when available.
+    Supports optional ContinuousRoPE2D with separate Q/K positions.
     """
 
     def __init__(
@@ -16,7 +67,8 @@ class CrossAttention(nn.Module):
         num_heads: int = 8,
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
-        proj_drop: float = 0.0
+        proj_drop: float = 0.0,
+        rope: Optional[ContinuousRoPE2D] = None
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -30,18 +82,23 @@ class CrossAttention(nn.Module):
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope
 
     def forward(
         self,
         query: torch.Tensor,
         key_value: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        q_positions: Optional[torch.Tensor] = None,
+        kv_positions: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
             query: (B, N_q, C) query tokens
             key_value: (B, N_kv, C) key-value tokens (encoder features)
             mask: Optional attention mask
+            q_positions: (B, N_q, 2) optional continuous 2D positions (y, x) for Q
+            kv_positions: (B, N_kv, 2) optional 2D positions (y, x) for K
 
         Returns:
             out: (B, N_q, C)
@@ -49,12 +106,14 @@ class CrossAttention(nn.Module):
         B, N_q, C = query.shape
         N_kv = key_value.shape[1]
 
-        # Project queries, keys, values
         q = self.q_proj(query).reshape(B, N_q, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(key_value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Use PyTorch's efficient attention (FlashAttention when available)
+        if self.rope is not None and q_positions is not None and kv_positions is not None:
+            q = self.rope(q, q_positions)
+            k = self.rope(k, kv_positions)
+
         x = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -96,8 +155,64 @@ class MLP(nn.Module):
         return x
 
 
+class SelfAttention(nn.Module):
+    """Self-attention with fused QKV projection, optional RoPE, using FlashAttention when available."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        rope: Optional[ContinuousRoPE2D] = None
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = attn_drop
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope
+
+    def forward(self, x: torch.Tensor, positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, C) input tokens
+            positions: (B, N, 2) optional continuous 2D positions (y, x) for RoPE
+        """
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        if self.rope is not None and positions is not None:
+            q = self.rope(q, positions)
+            k = self.rope(k, positions)
+
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop if self.training else 0.0
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class DecoderBlock(nn.Module):
-    """Decoder block with cross-attention and MLP."""
+    """Decoder block: self-attention (w/ RoPE) → cross-attention → MLP.
+
+    Self-attention enforces spatial coherence among query predictions.
+    ContinuousRoPE2D encodes 2D query positions into the self-attention,
+    so nearby queries attend to each other more strongly.
+    Output projection is zero-initialized for smooth fine-tuning from
+    pretrained weights that were trained without self-attention.
+    """
+
+    SA_CHUNK = 16384
 
     def __init__(
         self,
@@ -106,33 +221,70 @@ class DecoderBlock(nn.Module):
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         drop: float = 0.0,
-        attn_drop: float = 0.0
+        attn_drop: float = 0.0,
+        rope: Optional[ContinuousRoPE2D] = None
     ):
         super().__init__()
+        # Self-attention among query tokens (with optional RoPE)
+        self.norm_self = nn.LayerNorm(dim)
+        self.self_attn = SelfAttention(dim, num_heads, qkv_bias, attn_drop, drop, rope=rope)
+
+        # Cross-attention: query → encoder features (with optional RoPE)
         self.norm1 = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
-        self.cross_attn = CrossAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+        self.cross_attn = CrossAttention(dim, num_heads, qkv_bias, attn_drop, drop, rope=rope)
 
+        # FFN
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop=drop)
+
+        # Zero-init self-attn output so pretrained cross-attn weights stay effective
+        nn.init.zeros_(self.self_attn.proj.weight)
+        nn.init.zeros_(self.self_attn.proj.bias)
 
     def forward(
         self,
         query: torch.Tensor,
-        encoder_features: torch.Tensor
+        encoder_features: torch.Tensor,
+        query_positions: Optional[torch.Tensor] = None,
+        kv_positions: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
             query: (B, N_q, C) query tokens
             encoder_features: (B, N_kv, C) encoder output (Global Scene Representation)
+            query_positions: (B, N_q, 2) continuous 2D positions (y, x) for Q in self/cross-attn
+            kv_positions: (B, N_kv, 2) 2D grid positions (y, x) for K in cross-attn
 
         Returns:
             out: (B, N_q, C)
         """
-        # Cross-attention
+        # Self-attention with RoPE (chunked when Q is very large)
+        N_q = query.shape[1]
+        if N_q <= self.SA_CHUNK:
+            query = query + self.self_attn(self.norm_self(query), positions=query_positions)
+        else:
+            normed = self.norm_self(query)
+            chunks = normed.split(self.SA_CHUNK, dim=1)
+            if query_positions is not None:
+                pos_chunks = query_positions.split(self.SA_CHUNK, dim=1)
+                sa_out = torch.cat(
+                    [self.self_attn(c, positions=p) for c, p in zip(chunks, pos_chunks)],
+                    dim=1
+                )
+            else:
+                sa_out = torch.cat(
+                    [self.self_attn(chunk) for chunk in chunks],
+                    dim=1
+                )
+            query = query + sa_out
+
+        # Cross-attention with RoPE (Q at query positions, K at encoder grid positions)
         query = query + self.cross_attn(
             self.norm1(query),
-            self.norm_kv(encoder_features)
+            self.norm_kv(encoder_features),
+            q_positions=query_positions,
+            kv_positions=kv_positions
         )
         # MLP
         query = query + self.mlp(self.norm2(query))

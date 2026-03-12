@@ -15,7 +15,7 @@ from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from .sat_position import FourierEmbedder
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
-from .query import DecoderBlock, PatchEmbeddingFast
+from .query import DecoderBlock, PatchEmbeddingFast, ContinuousRoPE2D
 
 
 def freeze_all_params(modules):
@@ -32,12 +32,12 @@ class Pi3(nn.Module):
             self,
             pos_type='rope100',
             decoder_size='large',
-            load_vggt=False,
             load_pi3=True,
             freeze_encoder=True,
             use_global_points=False,
             train_conf=False,
             num_dec_blk_not_to_checkpoint=4,
+            query_deocder_depth=4,
             ckpt=None,
             default_query_count=112 * 112,
         ):
@@ -119,12 +119,13 @@ class Pi3(nn.Module):
             embed_dim=dec_embed_dim, 
             num_freqs=64, 
             scale=30.0, 
-            include_input=False,
+            include_input=True,
             zero_init=False
         )
+        self.query_rope = ContinuousRoPE2D(freq=100.0)
         self.query_decoder = nn.ModuleList([
-            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0)
-            for _ in range(4)
+            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0, rope=self.query_rope)
+            for _ in range(query_deocder_depth)
         ])
         self.query_norm = nn.LayerNorm(dec_embed_dim)
         self.patch_embed = PatchEmbeddingFast(patch_size=9, embed_dim=dec_embed_dim)
@@ -181,27 +182,6 @@ class Pi3(nn.Module):
 
         self.register_buffer("image_mean", image_mean)
         self.register_buffer("image_std", image_std)
-
-        if load_vggt:
-            vggt_weight = load_file('ckpts/VGGT-1B/model.safetensors')
-            vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
-            print("Loading vggt encoder", self.encoder.load_state_dict(vggt_enc_weight, strict=False))
-
-            vggt_dec_weight = {k.replace('aggregator.global_blocks.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.global_blocks.')}
-            vggt_dec_weight1 = {}
-            for k in list(vggt_dec_weight.keys()):
-                idx = k.split('.')[0]
-                other = k[len(idx):]
-                vggt_dec_weight1[f'{int(idx)*2 + 1}{other}'] = vggt_dec_weight[k]
-            vggt_dec_weight = vggt_dec_weight1 
-
-            vggt_dec_weight_frame = {k.replace('aggregator.frame_blocks.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.frame_blocks.')}
-            for k in list(vggt_dec_weight_frame.keys()):
-                idx = k.split('.')[0]
-                other = k[len(idx):]
-                vggt_dec_weight[f'{int(idx)*2}{other}'] = vggt_dec_weight_frame[k]
-
-            print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
 
         self.train_conf = train_conf
         if self.train_conf:
@@ -339,7 +319,7 @@ class Pi3(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs, queries=None): # [关键修改] 加入 queries 参数
+    def forward(self, imgs, queries=None, dense: bool = False, isTrain: bool = True): # [关键修改] 加入 queries 参数
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -369,23 +349,29 @@ class Pi3(nn.Module):
         hidden, pos = self.decode(hidden, N, H, W, sat_pos_embed)
 
         # ==========================================================
-        # 2. 生成/处理 Queries (u, v)，形状为(B, N*Num_queries, 2)
+        # 2. 生成/处理 Queries (u, v)
+        # - 若外部提供 queries（来自 dataset），则直接使用
+        # - 否则保留原有稀疏/稠密采样逻辑
         # ==========================================================
-        if queries is None:
-            y_steps = torch.linspace(0, 1, H, device=hidden.device, dtype=hidden.dtype)
-            x_steps = torch.linspace(0, 1, W, device=hidden.device, dtype=hidden.dtype)
-            grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
-            dense_queries = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
-            query_per_view = min(self.default_query_count, dense_queries.shape[0])
-            
-            # 1. 生成形状为 (B*N, Total_Points) 的随机数矩阵
-            rand_matrix = torch.rand(B * N, dense_queries.shape[0], device=hidden.device)
-            # 2. 在第一维上排序，取前 query_per_view 个索引
-            idx = rand_matrix.argsort(dim=1)[:, :query_per_view]
-            # 3. 高级索引批量提取
-            queries = dense_queries[idx] # 输出形状直接是 (B*N, query_per_view, 2)
-        else:
+        if queries is not None and dense is False:
             queries = queries.reshape(B * N, -1, 2)
+            query_per_view = queries.shape[1]
+        else:
+            # 使用像素中心约定 (pixel-center convention)，与 dataset 采样一致：
+            #   u = (pixel_x + 0.5) / W,  v = (pixel_y + 0.5) / H
+            x_steps = (torch.arange(W, device=hidden.device, dtype=hidden.dtype) + 0.5) / W
+            y_steps = (torch.arange(H, device=hidden.device, dtype=hidden.dtype) + 0.5) / H
+            grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
+            dense_queries = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)  # (H*W, 2)
+
+            if dense:
+                query_per_view = dense_queries.shape[0]
+                queries = dense_queries.unsqueeze(0).expand(B * N, -1, -1).contiguous() # (B*N, H*W, 2)
+            else:
+                query_per_view = min(self.default_query_count, dense_queries.shape[0])
+                rand_matrix = torch.rand(B * N, dense_queries.shape[0], device=hidden.device)
+                idx = rand_matrix.argsort(dim=1)[:, :query_per_view]
+                queries = dense_queries[idx] # (B*N, query_per_view, 2)
 
         num_queries = queries.shape[1]
 
@@ -404,8 +390,24 @@ class Pi3(nn.Module):
         query_hidden = self.query_hidden_project(hidden) # (B*N, grid_hw, embed_dim)
 
         # 3.3 让 Query 去图像特征 (hidden) 中提取信息
+        # --- RoPE 位置编码 ---
+        # Q positions: queries (u=x, v=y) in [0,1] → (y, x) 缩放到 patch 网格坐标
+        query_positions = torch.stack([
+            queries[..., 1] * (patch_h - 1),   # v → y
+            queries[..., 0] * (patch_w - 1),   # u → x
+        ], dim=-1).detach()  # (B*N, Q, 2), no grad
+
+        # KV positions: encoder patch tokens 在规则网格上的整数坐标
+        ky = torch.arange(patch_h, device=hidden.device, dtype=hidden.dtype)
+        kx = torch.arange(patch_w, device=hidden.device, dtype=hidden.dtype)
+        kv_grid = torch.cartesian_prod(ky, kx)  # (patch_h*patch_w, 2), (y, x)
+        kv_positions = kv_grid.unsqueeze(0).expand(B * N, -1, -1)  # (B*N, ph*pw, 2)
+
         for block in self.query_decoder:
-            query_embeddings = block(query_embeddings, query_hidden[:, self.patch_start_idx:])
+            query_embeddings = block(
+                query_embeddings, query_hidden[:, self.patch_start_idx:],
+                query_positions=query_positions, kv_positions=kv_positions
+            )
         point_hidden = self.query_norm(query_embeddings)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         if self.use_global_points:
@@ -433,11 +435,22 @@ class Pi3(nn.Module):
             # unproject local points using camera poses
             points = torch.einsum('bnij, bnqj -> bnqi', camera_poses, homogenize_points(local_points))[..., :3]
 
+        if dense and query_per_view == H * W and isTrain is False:
+            points_out = points.reshape(B, N, H, W, 3)
+            local_points_out = local_points.reshape(B, N, H, W, 3)
+            query_uv_out = queries.reshape(B, N, H, W, 2)
+            conf_out = conf.reshape(B, N, H, W, -1) if conf is not None else None
+        else:
+            points_out = points
+            local_points_out = local_points
+            query_uv_out = queries.reshape(B, N, query_per_view, 2)
+            conf_out = conf
+
         return dict[str, Any | None](
-            points=points,
-            local_points=local_points,
-            query_uv=queries.reshape(B, N, query_per_view, 2),
-            conf=conf,
+            points=points_out,
+            local_points=local_points_out,
+            query_uv=query_uv_out,
+            conf=conf_out,
             camera_poses=camera_poses,
             global_points=None
         )

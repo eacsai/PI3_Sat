@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 指定使用的GPU设备ID
+# os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 指定使用的GPU设备ID
 import sys
 sys.path.append('.')
 

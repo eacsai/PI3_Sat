@@ -342,6 +342,7 @@ class Pi3Loss(nn.Module):
         # 可视化：保存完整稠密点云（采样前）
         if self.save_vis:
             self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global_dense')
+            self.save_point_cloud_vis(gt_pts[:, :1], masks[:, :1], imgs[:, :1], prefix='gt_local_dense')
             test_img = to_pil_image(imgs[0, 1])
             test_img.save('test_img.png')
 
@@ -372,7 +373,7 @@ class Pi3Loss(nn.Module):
         sampled_global_pts = F.grid_sample(
             gt_pts_4d,
             grid.reshape(B*N, Q, 1, 2),
-            mode='bilinear',
+            mode='nearest',
             padding_mode='zeros',
             align_corners=True
         ).permute(0, 2, 3, 1).reshape(B, N, Q, 3)

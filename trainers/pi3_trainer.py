@@ -78,7 +78,13 @@ class Pi3Trainer(BaseTrainer):
             
     def forward_batch(self, batch, mode='train'):
         imgs = torch.stack([view['img'] for view in batch], dim=1)
-        pred = self.model(imgs)
+
+        # dataset 保证每个 view 都有 query_uv 且数量一致，collate 后一定是 (B,Q,2) tensor
+        if 'query_uv' in batch[0] and isinstance(batch[0]['query_uv'], torch.Tensor):
+            queries = torch.stack([v['query_uv'] for v in batch], dim=1)  # (B, N, Q, 2)
+            pred = self.model(imgs, queries=queries.to(device=imgs.device, dtype=imgs.dtype))
+        else:
+            pred = self.model(imgs)
 
         return [pred, batch]
     
