@@ -201,9 +201,8 @@ class SelfAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-
 class DecoderBlock(nn.Module):
-    """Decoder block: self-attention (w/ RoPE) → cross-attention → MLP.
+    """Decoder block: (optional) self-attention (w/ RoPE) → cross-attention → MLP.
 
     Self-attention enforces spatial coherence among query predictions.
     ContinuousRoPE2D encodes 2D query positions into the self-attention,
@@ -222,12 +221,24 @@ class DecoderBlock(nn.Module):
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        rope: Optional[ContinuousRoPE2D] = None
+        rope: Optional[ContinuousRoPE2D] = None, # 这里的 ContinuousRoPE2D 替换为你的 RoPE 类型
+        use_self_attn: bool = True  # ✨ 新增参数：默认开启 self-attention
     ):
         super().__init__()
-        # Self-attention among query tokens (with optional RoPE)
-        self.norm_self = nn.LayerNorm(dim)
-        self.self_attn = SelfAttention(dim, num_heads, qkv_bias, attn_drop, drop, rope=rope)
+        self.use_self_attn = use_self_attn
+
+        # ✨ 根据参数决定是否初始化 Self-attention
+        if self.use_self_attn:
+            self.norm_self = nn.LayerNorm(dim)
+            self.self_attn = SelfAttention(dim, num_heads, qkv_bias, attn_drop, drop, rope=rope)
+            
+            # Zero-init self-attn output so pretrained cross-attn weights stay effective
+            nn.init.zeros_(self.self_attn.proj.weight)
+            nn.init.zeros_(self.self_attn.proj.bias)
+        else:
+            # 保持属性存在，但设为 None
+            self.norm_self = None
+            self.self_attn = None
 
         # Cross-attention: query → encoder features (with optional RoPE)
         self.norm1 = nn.LayerNorm(dim)
@@ -237,10 +248,6 @@ class DecoderBlock(nn.Module):
         # FFN
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop=drop)
-
-        # Zero-init self-attn output so pretrained cross-attn weights stay effective
-        nn.init.zeros_(self.self_attn.proj.weight)
-        nn.init.zeros_(self.self_attn.proj.bias)
 
     def forward(
         self,
@@ -259,25 +266,28 @@ class DecoderBlock(nn.Module):
         Returns:
             out: (B, N_q, C)
         """
-        # Self-attention with RoPE (chunked when Q is very large)
-        N_q = query.shape[1]
-        if N_q <= self.SA_CHUNK:
-            query = query + self.self_attn(self.norm_self(query), positions=query_positions)
-        else:
-            normed = self.norm_self(query)
-            chunks = normed.split(self.SA_CHUNK, dim=1)
-            if query_positions is not None:
-                pos_chunks = query_positions.split(self.SA_CHUNK, dim=1)
-                sa_out = torch.cat(
-                    [self.self_attn(c, positions=p) for c, p in zip(chunks, pos_chunks)],
-                    dim=1
-                )
+        
+        # ✨ 只有开启了 use_self_attn 才会执行这段逻辑
+        if self.use_self_attn:
+            # Self-attention with RoPE (chunked when Q is very large)
+            N_q = query.shape[1]
+            if N_q <= self.SA_CHUNK:
+                query = query + self.self_attn(self.norm_self(query), positions=query_positions)
             else:
-                sa_out = torch.cat(
-                    [self.self_attn(chunk) for chunk in chunks],
-                    dim=1
-                )
-            query = query + sa_out
+                normed = self.norm_self(query)
+                chunks = normed.split(self.SA_CHUNK, dim=1)
+                if query_positions is not None:
+                    pos_chunks = query_positions.split(self.SA_CHUNK, dim=1)
+                    sa_out = torch.cat(
+                        [self.self_attn(c, positions=p) for c, p in zip(chunks, pos_chunks)],
+                        dim=1
+                    )
+                else:
+                    sa_out = torch.cat(
+                        [self.self_attn(chunk) for chunk in chunks],
+                        dim=1
+                    )
+                query = query + sa_out
 
         # Cross-attention with RoPE (Q at query positions, K at encoder grid positions)
         query = query + self.cross_attn(
@@ -286,6 +296,7 @@ class DecoderBlock(nn.Module):
             q_positions=query_positions,
             kv_positions=kv_positions
         )
+        
         # MLP
         query = query + self.mlp(self.norm2(query))
 

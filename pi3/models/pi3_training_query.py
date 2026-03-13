@@ -124,7 +124,7 @@ class Pi3(nn.Module):
         )
         self.query_rope = ContinuousRoPE2D(freq=100.0)
         self.query_decoder = nn.ModuleList([
-            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0, rope=self.query_rope)
+            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0, rope=self.query_rope, use_self_attn=False)
             for _ in range(query_deocder_depth)
         ])
         self.query_norm = nn.LayerNorm(dec_embed_dim)
@@ -387,7 +387,8 @@ class Pi3(nn.Module):
 
         patch_rgb_embeddings = self.patch_embed(imgs, queries)  # (B*N, Num_queries, embed_dim)
         query_embeddings = query_pos_embeddings + patch_rgb_embeddings + self.query_token.expand(B*N, num_queries, -1)
-        query_hidden = self.query_hidden_project(hidden) # (B*N, grid_hw, embed_dim)
+        ## 把hidden的patch_h*patch_w个patch token当作KV，送入 DecoderBlock 进行交叉注意力计算，得到 query_embeddings 的更新
+        query_hidden = self.query_hidden_project(hidden[:, self.patch_start_idx:]) # (B*N, grid_hw, embed_dim)
 
         # 3.3 让 Query 去图像特征 (hidden) 中提取信息
         # --- RoPE 位置编码 ---
@@ -405,10 +406,12 @@ class Pi3(nn.Module):
 
         for block in self.query_decoder:
             query_embeddings = block(
-                query_embeddings, query_hidden[:, self.patch_start_idx:],
+                query_embeddings, query_hidden,
                 query_positions=query_positions, kv_positions=kv_positions
             )
         point_hidden = self.query_norm(query_embeddings)
+
+        # 3.4. 处理相机hidden
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         if self.use_global_points:
             context = hidden.reshape(B, N, patch_h*patch_w+self.patch_start_idx, -1)[:, 0:1].repeat(1, N, 1, 1).reshape(B*N, patch_h*patch_w+self.patch_start_idx, -1)
