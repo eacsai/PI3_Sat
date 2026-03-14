@@ -129,7 +129,8 @@ class Pi3(nn.Module):
         ])
         self.query_norm = nn.LayerNorm(dec_embed_dim)
         self.patch_embed = PatchEmbeddingFast(patch_size=9, embed_dim=dec_embed_dim)
-        self.query_token = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
+        self.query_token_sat = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
+        self.query_token_grd = nn.Parameter(torch.zeros(1, 1, dec_embed_dim))
         self.default_query_count = int(default_query_count)
 
         # ----------------------
@@ -148,7 +149,6 @@ class Pi3(nn.Module):
             nn.GELU(),
             nn.Linear(512, 3)
         )
-
         # ----------------------
         #  Camera Pose Decoder
         # ----------------------
@@ -192,7 +192,8 @@ class Pi3(nn.Module):
             )
             freeze_all_params([
                 self.encoder, self.decoder, self.query_pos_embedder, self.query_decoder,
-                self.query_norm, self.patch_embed, self.query_token, self.query_point_head,
+                self.query_norm, self.patch_embed, self.query_token_sat, self.query_token_grd, # <-- 更新这里
+                self.query_point_head,
                 self.camera_decoder, self.camera_head, self.register_token
             ])
         else:
@@ -382,15 +383,20 @@ class Pi3(nn.Module):
         query_pos_embeddings = self.query_pos_embedder(queries * 2.0 - 1.0) # (B*N, Num_queries, 2)
 
         # 3.2 Local RGB patch embedding
-        if imgs.dim() == 5 and imgs.shape[-1] == 3:
-            imgs = imgs.permute(0, 1, 4, 2, 3)  # (B, N, H, W, C) -> (B, N, C, H, W)
-
         patch_rgb_embeddings = self.patch_embed(imgs, queries)  # (B*N, Num_queries, embed_dim)
-        query_embeddings = query_pos_embeddings + patch_rgb_embeddings + self.query_token.expand(B*N, num_queries, -1)
+        
+        # 3.3 Query Token embedding
+        token_sat = self.query_token_sat.unsqueeze(0).expand(B, 1, num_queries, -1)
+        token_grd = self.query_token_grd.unsqueeze(0).expand(B, N-1, num_queries, -1)
+        token_all = torch.cat([token_sat, token_grd], dim=1)
+        token_all = token_all.reshape(B*N, num_queries, -1)
+
+        # 3.4 将位置编码、RGB patch embedding 和 Query token embedding 叠加，得到初始的 query_embeddings
+        query_embeddings = query_pos_embeddings + patch_rgb_embeddings + token_all
         ## 把hidden的patch_h*patch_w个patch token当作KV，送入 DecoderBlock 进行交叉注意力计算，得到 query_embeddings 的更新
         query_hidden = self.query_hidden_project(hidden[:, self.patch_start_idx:]) # (B*N, grid_hw, embed_dim)
 
-        # 3.3 让 Query 去图像特征 (hidden) 中提取信息
+        # 3.5 让 Query 去图像特征 (hidden) 中提取信息
         # --- RoPE 位置编码 ---
         # Q positions: queries (u=x, v=y) in [0,1] → (y, x) 缩放到 patch 网格坐标
         query_positions = torch.stack([
@@ -410,8 +416,8 @@ class Pi3(nn.Module):
                 query_positions=query_positions, kv_positions=kv_positions
             )
         point_hidden = self.query_norm(query_embeddings)
-
-        # 3.4. 处理相机hidden
+        
+        # 3.6. 处理相机hidden
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         if self.use_global_points:
             context = hidden.reshape(B, N, patch_h*patch_w+self.patch_start_idx, -1)[:, 0:1].repeat(1, N, 1, 1).reshape(B*N, patch_h*patch_w+self.patch_start_idx, -1)
@@ -421,9 +427,11 @@ class Pi3(nn.Module):
             # local points
             point_hidden = point_hidden.float()
             ret = self.query_point_head(point_hidden).reshape(B, N, query_per_view, -1)
-            xy, z = ret.split([2, 1], dim=-1)
+            sat_points = ret[:, 0:1]
+            xy, z = ret[:, 1:].split([2, 1], dim=-1)
             z = torch.exp(z)
-            local_points = torch.cat([xy * z, z], dim=-1)
+            grd_points = torch.cat([xy * z, z], dim=-1)
+            local_points = torch.cat([sat_points, grd_points], dim=1)  # [B, N, Q, 3]
 
             # confidence
             if self.train_conf:
