@@ -488,3 +488,44 @@ class PatchEmbeddingFast(nn.Module):
         # 6. 展平和 MLP 编码
         patches_flat = patches.reshape(B * T, N, -1)
         return self.mlp(patches_flat)
+
+class MultiScaleQueryEmbedder(nn.Module):
+    def __init__(self, embed_dim, hidden_dim):
+        super().__init__()
+        # 尺度 0：RGB 高频细节分支 (保留硬边缘)
+        self.rgb_proj = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.GELU(),
+            nn.Linear(64, embed_dim)
+        )
+        # 尺度 1：Decoder 隐藏层低频语义分支 (理解几何)
+        self.feat_proj = nn.Sequential(
+            nn.Linear(hidden_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        # 融合层
+        self.fusion = nn.Linear(embed_dim * 2, embed_dim)
+
+    def forward(self, rgb, feat_map, queries):
+        """
+        rgb: [B*N, 3, H, W]  原图
+        feat_map: [B*N, C, patch_h, patch_w]  特征图
+        queries: [B*N, Q, 2] 连续坐标，值域在 [0, 1]
+        """
+        # grid_sample 需要的坐标域是 [-1, 1]
+        grid = queries * 2.0 - 1.0  
+        grid = grid.unsqueeze(1) # 变成 [B*N, 1, Q, 2] 以适配 grid_sample
+        
+        # 1. 采样高分辨率 RGB
+        rgb_sampled = torch.nn.functional.grid_sample(rgb, grid, mode='bilinear', align_corners=False)
+        rgb_sampled = rgb_sampled.squeeze(2).transpose(1, 2) # [B*N, Q, 3]
+        rgb_embed = self.rgb_proj(rgb_sampled)
+        
+        # 2. 采样低分辨率特征图 (hidden)
+        feat_sampled = torch.nn.functional.grid_sample(feat_map, grid, mode='bilinear', align_corners=False)
+        feat_sampled = feat_sampled.squeeze(2).transpose(1, 2) # [B*N, Q, C]
+        feat_embed = self.feat_proj(feat_sampled)
+        
+        # 3. 融合多尺度特征
+        return self.fusion(torch.cat([rgb_embed, feat_embed], dim=-1))

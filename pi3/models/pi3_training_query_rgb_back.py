@@ -11,7 +11,6 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextTransformerDecoder
 from .layers.camera_head import CameraHead
-from .layers.conv_head import ConvHead, InfiniDepthFusion
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from .sat_position import FourierEmbedder
 from torch.utils.checkpoint import checkpoint
@@ -121,22 +120,12 @@ class Pi3(nn.Module):
             num_freqs=64, 
             scale=30.0, 
             include_input=True,
-            zero_init=True
+            zero_init=False
         )
-        self.conv_head = ConvHead(
-            num_features=1,                 # 你的代码没用到这个参数，填 1 占位
-            dim_in=self.dec_embed_dim,      # 输入维度 (1024 * 2，因为后面会和 hidden 拼接)
-            dim_out=[128],                  # 最终输出的 f_high 维度
-            dim_proj=512,                   # f_low 的维度 (第一层投影)
-            dim_upsample=[256, 128, 128],   # 上采样阶段的通道数 (f_mid 会截取第一个 256)
-            last_conv_channels=128,         # ⚠️ 必须修改！防止 128 维输出被 32 维瓶颈卡死
-            dim_times_res_block_hidden=2,
-            num_res_blocks=2,
-            res_block_norm='group_norm',
-            projects=nn.Linear(self.dec_embed_dim * 2, 512), # 将 DINOv2 的 1024 * 2 维压缩成 f_low
-            using_uv=True                   # ⚠️ 注入极其关键的 UV 坐标空间先验！
+        self.multi_scale_embedder = MultiScaleQueryEmbedder(
+            embed_dim=dec_embed_dim, 
+            hidden_dim=dec_embed_dim * 2 
         )
-        self.ms_fusion = InfiniDepthFusion(dims=[128, 256, 512], target_dim=dec_embed_dim)
         self.query_rope = ContinuousRoPE2D(freq=100.0)
         self.query_decoder = nn.ModuleList([
             DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio, True, 0.0, 0.0, rope=self.query_rope, use_self_attn=False)
@@ -207,7 +196,7 @@ class Pi3(nn.Module):
             )
             freeze_all_params([
                 self.encoder, self.decoder, self.query_pos_embedder, self.query_decoder,
-                self.query_norm, self.conv_head, self.ms_fusion, self.query_token_sat, self.query_token_grd, # <-- 更新这里
+                self.query_norm, self.multi_scale_embedder, self.query_token_sat, self.query_token_grd, # <-- 更新这里
                 self.query_point_head,
                 self.camera_decoder, self.camera_head, self.register_token
             ])
@@ -401,24 +390,11 @@ class Pi3(nn.Module):
         # patch_rgb_embeddings = self.patch_embed(imgs, queries)  # (B*N, Num_queries, embed_dim)
         
         # 3.2 InfiniDepth 风格的多尺度局部特征采样
-        # 3.2.1 获取多尺度金字塔特征
-        feat_low, feat_mid, feat_high = self.conv_head(hidden[:, self.patch_start_idx:], image=frames)
+        hidden_spatial = hidden[:, self.patch_start_idx:] # [B*N, hw, 2048]
+        hidden_spatial = hidden_spatial.transpose(1, 2).reshape(B*N, -1, patch_h, patch_w) # [B*N, C, patch_h, patch_w]
         
-        # 3.2.2 连续坐标网格采样
-        grid = queries * 2.0 - 1.0  
-        grid = grid.unsqueeze(1)    # [B*N, 1, Q, 2]
-        
-        # 写一个小函数批量采样，让代码保持极度整洁
-        def sample_feat(feat_map):
-            sampled = torch.nn.functional.grid_sample(feat_map, grid, mode='bilinear', align_corners=False)
-            return sampled.squeeze(2).transpose(1, 2)
-
-        f_low_sampled = sample_feat(feat_low)   # [B*N, Q, 512]
-        f_mid_sampled = sample_feat(feat_mid)   # [B*N, Q, 256]
-        f_high_sampled = sample_feat(feat_high) # [B*N, Q, 128]
-        
-        # 3.2.3 InfiniDepth 门控层级融合！
-        ms_patch_embeddings = self.ms_fusion(f_high_sampled, f_mid_sampled, f_low_sampled) # [B*N, Q, dec_embed_dim]
+        # 在连续坐标处，同时采样高频 RGB 与 低频 Hidden，并融合
+        ms_patch_embeddings = self.multi_scale_embedder(frames, hidden_spatial, queries) # [B*N, Num_queries, dim]
 
         # 3.3 Query Token embedding
         token_sat = self.query_token_sat.unsqueeze(0).expand(B, 1, num_queries, -1)
