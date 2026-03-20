@@ -124,7 +124,6 @@ class Pi3(nn.Module):
             zero_init=True
         )
         self.conv_head = ConvHead(
-            num_features=1,                 # 你的代码没用到这个参数，填 1 占位
             dim_in=self.dec_embed_dim,      # 输入维度 (1024 * 2，因为后面会和 hidden 拼接)
             dim_out=[128],                  # 最终输出的 f_high 维度
             dim_proj=512,                   # f_low 的维度 (第一层投影)
@@ -247,8 +246,11 @@ class Pi3(nn.Module):
             print("Loading pi3 weights", res)
             if res.unexpected_keys:
                 print("[Pi3] Unexpected keys (in ckpt but not in model):", res.unexpected_keys)
+            if res.missing_keys:
+                print("================================================")
+                print("[Pi3] Missing keys (in model but not in ckpt):", res.missing_keys)
 
-    def decode(self, hidden, N, H, W, sat_pos_embed=None):
+    def decode(self, hidden, N, H, W, sat_pos_embed=None, is_sat_mask: torch.Tensor | None = None):
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -291,16 +293,24 @@ class Pi3(nn.Module):
         # ======================================================================
         if sat_pos_embed is not None:
             if self.patch_start_idx > 0:
-                pad_zeros = torch.zeros(B, self.patch_start_idx, sat_pos_embed.shape[-1], 
-                                        device=sat_pos_embed.device, dtype=sat_pos_embed.dtype)
-                sat_pos_embed = torch.cat([pad_zeros, sat_pos_embed], dim=1) # 变成 (B, hw, dim)
+                pad_zeros = torch.zeros(
+                    B, self.patch_start_idx, sat_pos_embed.shape[-1],
+                    device=sat_pos_embed.device, dtype=sat_pos_embed.dtype
+                )
+                sat_pos_embed = torch.cat([pad_zeros, sat_pos_embed], dim=1)  # (B, hw, dim)
 
-            # 暂时变形为 (B, N, hw, dim) 以便精准定位 View 0
+            # 暂时变形为 (B, N, hw, dim)，根据 is_sat_mask 精准定位卫星视图
             hidden = hidden.reshape(B, N, hw, -1)
-            
-            # 仅对 View 0 (卫星图) 叠加位置编码，且只加这一次！
-            hidden[:, 0] = hidden[:, 0] + sat_pos_embed
-            
+
+            if is_sat_mask is not None:
+                # is_sat_mask: (B, N) bool → (B, N, 1, 1) float
+                sat_mask = is_sat_mask.to(hidden.device).unsqueeze(-1).unsqueeze(-1).float()
+                sat_pos = sat_pos_embed[:, None, :, :]  # (B, 1, hw, dim)
+                hidden = hidden + sat_mask * sat_pos
+            else:
+                # 兼容旧逻辑：没有 mask 时，默认第 0 个视图为卫星图
+                hidden[:, 0] = hidden[:, 0] + sat_pos_embed
+
             # 重新展平为 (B*N, hw, dim)，准备进入 Decoder 循环
             hidden = hidden.reshape(B*N, hw, -1)
         # ======================================================================
@@ -335,7 +345,8 @@ class Pi3(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs, queries=None, dense: bool = False, isTrain: bool = True): # [关键修改] 加入 queries 参数
+    def forward(self, imgs, queries=None, is_sat_mask: torch.Tensor | None = None,
+                dense: bool = False, isTrain: bool = True):  # [关键修改] 加入 queries 和 is_sat_mask 参数
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -361,8 +372,8 @@ class Pi3(nn.Module):
         
         # 保存下来供 decode 循环使用
         sat_pos_embed = sat_pos_embed.reshape(B, patch_h * patch_w, -1)
-        # 将 sat_pos_embed 传给 decode
-        hidden, pos = self.decode(hidden, N, H, W, sat_pos_embed)
+        # 将 sat_pos_embed 传给 decode，并用 is_sat_mask 控制哪些视图叠加卫星位置编码
+        hidden, pos = self.decode(hidden, N, H, W, sat_pos_embed, is_sat_mask=is_sat_mask)
 
         # ==========================================================
         # 2. 生成/处理 Queries (u, v)
@@ -461,12 +472,24 @@ class Pi3(nn.Module):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # local points
             point_hidden = point_hidden.float()
-            ret = self.query_point_head(point_hidden).reshape(B, N, query_per_view, -1)
-            sat_points = ret[:, 0:1]
-            xy, z = ret[:, 1:].split([2, 1], dim=-1)
-            z = torch.exp(z)
-            grd_points = torch.cat([xy * z, z], dim=-1)
-            local_points = torch.cat([sat_points, grd_points], dim=1)  # [B, N, Q, 3]
+            ret = self.query_point_head(point_hidden).reshape(B, N, query_per_view, -1)  # (B, N, Q, 3)
+
+            # 约定：
+            # - 卫星视图：ret 直接表示 xyz（与 pi3_training_sat 保持一致）
+            # - 非卫星视图：ret 表示 (xy, log_z)，用 exp(z) 保证深度为正，再投影到局部坐标
+            xy, z = ret.split([2, 1], dim=-1)          # (B, N, Q, 2), (B, N, Q, 1)
+            z_pos = torch.exp(z)
+            grd_points_all = torch.cat([xy * z_pos, z_pos], dim=-1)  # (B, N, Q, 3)
+            sat_points_all = ret                                     # (B, N, Q, 3)
+
+            if is_sat_mask is not None:
+                mask = is_sat_mask.to(ret.device).view(B, N, 1, 1)   # (B, N, 1, 1) bool
+                local_points = torch.where(mask, sat_points_all, grd_points_all)
+            else:
+                # 兼容旧逻辑：若未提供 mask，则假定第 0 个视图为卫星，其余为地面/无人机
+                sat_points = sat_points_all[:, 0:1]      # (B, 1, Q, 3)
+                grd_points = grd_points_all[:, 1:]       # (B, N-1, Q, 3)
+                local_points = torch.cat([sat_points, grd_points], dim=1)  # [B, N, Q, 3]
 
             # confidence
             if self.train_conf:

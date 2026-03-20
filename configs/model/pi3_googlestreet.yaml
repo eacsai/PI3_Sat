@@ -11,7 +11,7 @@ model:
     num_dec_blk_not_to_checkpoint: 4
     ckpt: null # <path-to-your-pretrain-checkpoint>
     default_query_count: 8192
-    query_decoder_depth: 5
+    query_decoder_depth: 4
 
 loss:
     train_loss: 

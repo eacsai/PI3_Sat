@@ -61,8 +61,7 @@ class ResidualConvBlock(nn.Module):
 
 class ConvHead(nn.Module):
     def __init__(
-        self, 
-        num_features: int,
+        self,
         dim_in: int, 
         dim_out: List[int], 
         dim_proj: int = 512,
@@ -137,7 +136,10 @@ class ConvHead(nn.Module):
                 uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
                 x = torch.cat([x, uv], dim=1)
             for layer in block:
-                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+                if self.training:
+                    x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+                else:
+                    x = layer(x)
             if i == 0:
                     feat_mid = x
 
@@ -149,9 +151,12 @@ class ConvHead(nn.Module):
             x = torch.cat([x, uv], dim=1)
 
         if isinstance(self.output_block, nn.ModuleList):
-            output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+            if self.training:
+                output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+            else:
+                output = [block(x) for block in self.output_block]
         else:
-            output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
+            output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False) if self.training else self.output_block(x)
         
         feat_high = output[0] if isinstance(output, list) else output
         

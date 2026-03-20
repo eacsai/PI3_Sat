@@ -77,14 +77,26 @@ class Pi3Trainer(BaseTrainer):
                 dataset._set_resolutions(resolutions)
             
     def forward_batch(self, batch, mode='train'):
-        imgs = torch.stack([view['img'] for view in batch], dim=1)
+        # unified_collate_fn 返回的是一个按视图索引展开的 list[dict]，
+        # 其中每个 dict 的张量已经按 batch 维度 collate 好了。
+        imgs = torch.stack([view['img'] for view in batch], dim=1)  # (B, N, C, H, W)
+
+        # (B, N) bool，指示每个 sample 的每个 view 是否是卫星图
+        if 'is_satellite' in batch[0] and isinstance(batch[0]['is_satellite'], torch.Tensor):
+            is_sat_mask = torch.stack([v['is_satellite'] for v in batch], dim=1).to(device=imgs.device)
+        else:
+            is_sat_mask = None
 
         # dataset 保证每个 view 都有 query_uv 且数量一致，collate 后一定是 (B,Q,2) tensor
         if 'query_uv' in batch[0] and isinstance(batch[0]['query_uv'], torch.Tensor):
             queries = torch.stack([v['query_uv'] for v in batch], dim=1)  # (B, N, Q, 2)
-            pred = self.model(imgs, queries=queries.to(device=imgs.device, dtype=imgs.dtype))
+            pred = self.model(
+                imgs,
+                queries=queries.to(device=imgs.device, dtype=imgs.dtype),
+                is_sat_mask=is_sat_mask
+            )
         else:
-            pred = self.model(imgs)
+            pred = self.model(imgs, is_sat_mask=is_sat_mask)
 
         return [pred, batch]
     

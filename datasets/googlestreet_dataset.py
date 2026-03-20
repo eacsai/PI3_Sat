@@ -165,7 +165,10 @@ class GoogleStreetDataset(BaseDataset):
         
         sorted_files = sorted(npy_configs, key=get_sort_priority)
 
-        views = []
+        # 分开存储：卫星视图 vs 地面/无人机视图
+        satellite_views = []
+        ground_drone_views = []
+
         for idx, npy_name in enumerate(sorted_files):
             prefix = npy_name.replace('_rgb.npy', '')
 
@@ -250,11 +253,12 @@ class GoogleStreetDataset(BaseDataset):
 
             # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
             # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。
-            if "satellite" in prefix:
+            is_sat = "satellite" in prefix
+            if is_sat:
                 tmp_sat_height = -c2w[1,3]
                 depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
 
-            views.append(dict(
+            view_dict = dict(
                 img=rgb,
                 depthmap=depth.astype(np.float32),
                 query_uv=_sample_query_uv(depth.astype(np.float32)),
@@ -265,23 +269,32 @@ class GoogleStreetDataset(BaseDataset):
                 label=f'mega_depth_{prefix}_{index}',
                 instance=str(prefix + '_' + str(index)),
                 sat_meters=current_sat_meters,
-                sat_shift_east=shift_east if "satellite" in prefix else 0,
-                sat_shift_south=shift_south if "satellite" in prefix else 0
-            ))
+                sat_shift_east=shift_east if is_sat else 0,
+                sat_shift_south=shift_south if is_sat else 0,
+                is_satellite=bool(is_sat)
+            )
 
-        # 排序打乱逻辑：确保卫星图始终在第一位
-        if len(views) >= 3:
-            lst = list(range(1, len(views)))
-            random.shuffle(lst)
-            lst.insert(0, 0)
-            views = [views[i] for i in lst]  
+            if is_sat:
+                satellite_views.append(view_dict)
+            else:
+                ground_drone_views.append(view_dict)
+
+        # 在各自列表内部打乱顺序
+        if len(satellite_views) > 1:
+            random.shuffle(satellite_views)
+        if len(ground_drone_views) > 1:
+            random.shuffle(ground_drone_views)
 
 
         # 可视化所有view在世界坐标系下的带颜色的点云，并保存为.ply文件
         # view_idx = [0, 1, 2]
         # self._save_colored_pointcloud_ply([views[i] for i in view_idx])
 
-        return views
+        # 返回带有分组信息的对象，后续在 BaseDataset 中再展开为扁平列表
+        return {
+            "satellite": satellite_views,      # 可以是 0 张、多张任意组合
+            "ground_drone": ground_drone_views # 所有 ground / uav 视图
+        }
 
     def _save_colored_pointcloud_ply(self, views):
         # 此部分与原代码完全保持一致，未做修改

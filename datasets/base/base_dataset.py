@@ -200,6 +200,12 @@ class BaseDataset(EasyDataset):
             try:
                 views = self._get_views(idx, resolution, self._rng)
 
+                # 兼容新格式：_get_views 可能返回 dict{'satellite': [...], 'ground_drone': [...]}
+                if isinstance(views, dict):
+                    sat_list = views.get("satellite", []) or []
+                    gd_list = views.get("ground_drone", []) or []
+                    views = sat_list + gd_list
+
                 # assert len(views) == self.frame_num
                 if self.shuffle:
                     self._rng.shuffle(views)
