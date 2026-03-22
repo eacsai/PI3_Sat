@@ -96,7 +96,7 @@ class Pi3Trainer(BaseTrainer):
                 is_sat_mask=is_sat_mask
             )
         else:
-            pred = self.model(imgs, is_sat_mask=is_sat_mask)
+            pred = self.model(imgs)
 
         return [pred, batch]
     

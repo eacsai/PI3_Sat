@@ -14,7 +14,7 @@ train_dataset:
         z_far: 30000
         frame_num: 3
         aug_crop: 16
-        use_query: true
+        use_query: false
         transform:
             _partial_: true
             _target_: datasets.base.transforms.JitterJpegLossBlurring
@@ -37,7 +37,7 @@ test_dataset:
         shift_range: 20
         z_far: 30000
         frame_num: 3
-        use_query: true
+        use_query: false
         resolution:
             - [252, 252]
         transform:
@@ -49,3 +49,5 @@ test_dataset:
 test_dataloader:
     drop_last: False
     shuffle: False
+
+# HYDRA_FULL_ERROR=1

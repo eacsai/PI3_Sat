@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 from .transforms import *
 import pandas as pd
 from .utils import *
+from datasets.query import sample_query_uv
 
 import plyfile
 from plyfile import PlyData, PlyElement
@@ -31,6 +32,7 @@ class BaseDataset(EasyDataset):
         random_sample_thres=0.1,
         shuffle=True,
         use_sparse_depth=False,
+        use_query=True,
     ):
         super().__init__()
         self.frame_num = frame_num
@@ -67,6 +69,8 @@ class BaseDataset(EasyDataset):
         self.max_refetch = max_refetch
 
         self.random_sample_thres = random_sample_thres  # default not to do that
+
+        self.use_query = use_query
 
     def set_epoch(self, epoch, base_seed=None):
         """每个 epoch 更新一次；与 pi3_trainer.before_epoch 中 dataset.set_epoch 对齐。"""
@@ -279,8 +283,10 @@ class BaseDataset(EasyDataset):
 
                 for view in views:
                     view['img'] = self.transform(view['img'])
-
-
+                    if self.use_query:
+                        view['query_uv'] = sample_query_uv(view['depthmap'], view['valid_mask'], sample_rng)
+                    else:
+                        view['is_satellite'] = None
                 # # Visualize the point cloud
                 # all_pts = []
                 # all_colors = []

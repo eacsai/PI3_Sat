@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - model: pi3_googlestreet_ori.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_ori.yaml
+  - general: googlestreet_ori.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
