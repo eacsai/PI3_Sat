@@ -78,36 +78,71 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
     return final_paths
 
 
-def _sample_query_uv(depth, rng, Q=8192, edge_ratio=0.3):
-    """向量化地从深度图中采样 Q 个 query 点，偏重深度边缘，只在有效区域采样。
-    
-    若有效像素不足 Q 个，抛出 ValueError 让上层换数据。
+def _sample_query_uv(depth, rng, Q=8192, edge_ratio=0.3, flat_ratio=0.25):
+    """从深度图中采样 Q 个 query：边缘（高梯度）/ 平坦（低梯度）/ 随机，只在有效区域采样。
+
+    卫星图可提高 flat_ratio、降低 edge_ratio，减轻立面/房顶对噪声深度的过拟合。
     返回 (Q, 2) 的 float32 数组，值域 [0, 1]。
     """
     H, W = depth.shape
     min_depth = np.min(depth)
     # TODO: 这里valid_indices是否合理
     valid_indices = np.flatnonzero(depth > max(min_depth, 0.0))
-    if valid_indices.size < Q:
-        raise ValueError(f"Not enough valid pixels ({valid_indices.size} < {Q})")
+    n_valid = valid_indices.size
+    if n_valid < Q:
+        raise ValueError(f"Not enough valid pixels ({n_valid} < {Q})")
 
-    k_edge = min(int(Q * edge_ratio), valid_indices.size)
-    k_rand = Q - k_edge
+    edge_ratio = float(np.clip(edge_ratio, 0.0, 1.0))
+    flat_ratio = float(np.clip(flat_ratio, 0.0, 1.0))
+    k_edge = min(int(round(Q * edge_ratio)), n_valid)
+    k_flat = min(int(round(Q * flat_ratio)), n_valid - k_edge)
+    k_rand = Q - k_edge - k_flat
+    if k_rand < 0:
+        k_rand = 0
+        k_flat = min(k_flat, max(0, Q - k_edge))
 
-    # Sobel 梯度（只在 valid 像素上取值）
     gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
     grad_at_valid = np.hypot(gx.ravel()[valid_indices], gy.ravel()[valid_indices])
 
-    # argpartition 选出梯度最大的 k_edge 个（O(n) 复杂度）
-    edge_local = np.argpartition(-grad_at_valid, k_edge)[:k_edge]
+    sampled_parts = []
+    used = np.zeros(n_valid, dtype=bool)
 
-    # 从剩余 valid 像素中随机抽取 k_rand 个
-    remain_local = np.delete(np.arange(valid_indices.size), edge_local)
-    rand_local = remain_local[rng.choice(remain_local.size, size=k_rand, replace=False)]
+    if k_edge > 0:
+        edge_local = np.argpartition(-grad_at_valid, min(k_edge, n_valid) - 1)[:k_edge]
+        sampled_parts.append(edge_local)
+        used[edge_local] = True
 
-    sampled = valid_indices[np.concatenate([edge_local, rand_local])]
+    remain = np.flatnonzero(~used)
+    if k_flat > 0 and remain.size > 0:
+        kf = min(k_flat, remain.size)
+        grad_r = grad_at_valid[remain]
+        flat_sub = np.argpartition(grad_r, kf - 1)[:kf]
+        flat_local = remain[flat_sub]
+        sampled_parts.append(flat_local)
+        used[flat_local] = True
 
+    remain2 = np.flatnonzero(~used)
+    need = Q - sum(len(p) for p in sampled_parts)
+    need = min(need, remain2.size)
+    if need > 0:
+        rand_local = remain2[rng.choice(remain2.size, size=need, replace=False)]
+        sampled_parts.append(rand_local)
+
+    sampled_local = np.concatenate(sampled_parts) if sampled_parts else np.zeros(0, dtype=np.int64)
+    if sampled_local.size < Q:
+        pick_mask = np.ones(n_valid, dtype=bool)
+        if sampled_local.size > 0:
+            pick_mask[sampled_local] = False
+        pool = np.flatnonzero(pick_mask)
+        if pool.size > 0:
+            extra = min(Q - sampled_local.size, pool.size)
+            add = pool[rng.choice(pool.size, size=extra, replace=False)]
+            sampled_local = np.concatenate([sampled_local, add])
+    if sampled_local.size > Q:
+        sampled_local = sampled_local[:Q]
+
+    sampled = valid_indices[sampled_local]
     ys, xs = np.divmod(sampled, W)
     return np.stack([(xs + 0.5) / W, (ys + 0.5) / H], axis=-1).astype(np.float32)
 
@@ -119,6 +154,11 @@ class GoogleStreetDataset(BaseDataset):
         verbose=False,
         split=False,
         shift_range=20,
+        query_sample_count: int = 8192,
+        query_edge_ratio: float = 0.3,
+        query_flat_ratio: float = 0.25,
+        satellite_query_edge_ratio: float = 0.15,
+        satellite_query_flat_ratio: float = 0.55,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -132,6 +172,11 @@ class GoogleStreetDataset(BaseDataset):
         self.shift_range = shift_range 
         self.sat_height = 5726
         self.sat_gap = 60
+        self.query_sample_count = int(query_sample_count)
+        self.query_edge_ratio = float(query_edge_ratio)
+        self.query_flat_ratio = float(query_flat_ratio)
+        self.satellite_query_edge_ratio = float(satellite_query_edge_ratio)
+        self.satellite_query_flat_ratio = float(satellite_query_flat_ratio)
 
     def __len__(self):
         return len(self.file_paths)
@@ -284,10 +329,18 @@ class GoogleStreetDataset(BaseDataset):
             #     tmp_sat_height = -c2w[1,3]
             #     depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
 
+            er = self.satellite_query_edge_ratio if is_sat else self.query_edge_ratio
+            fr = self.satellite_query_flat_ratio if is_sat else self.query_flat_ratio
             view_dict = dict(
                 img=rgb,
                 depthmap=depth.astype(np.float32),
-                query_uv=_sample_query_uv(depth.astype(np.float32), rng),
+                query_uv=_sample_query_uv(
+                    depth.astype(np.float32),
+                    rng,
+                    Q=self.query_sample_count,
+                    edge_ratio=er,
+                    flat_ratio=fr,
+                ),
                 camera_pose=c2w.astype(np.float32),
                 camera_intrinsics=K.astype(np.float32),
                 sat_gap=self.sat_gap,

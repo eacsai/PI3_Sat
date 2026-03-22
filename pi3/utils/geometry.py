@@ -80,13 +80,13 @@ def satellite_depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsic
     assert camera_pose_ori is not None and camera_pose_new is not None
     R_cam2world = camera_pose_ori[:3, :3]
     t_cam2world = camera_pose_ori[:3, 3]
-    R_cam2world_new = camera_pose_new[:3, :3]
-    t_cam2world_new = camera_pose_new[:3, 3]
+    R_world2cam_new = camera_pose_new[:3, :3]
+    t_world2cam_new = camera_pose_new[:3, 3]
     X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
 
     # Express in absolute coordinates (invalid depth values)
     X_world = np.einsum("ik, vuk -> vui", R_cam2world, X_cam) + t_cam2world[None, None, :]
-    X_camera_new = np.einsum("ik, vuk -> vui", R_cam2world_new, X_world) + t_cam2world_new[None, None, :]
+    X_camera_new = np.einsum("ik, vuk -> vui", R_world2cam_new, X_world) + t_world2cam_new[None, None, :]
     new_depthmap = X_camera_new[:, :, 2]
     valid_mask = new_depthmap > 0 & valid_mask
 
