@@ -432,9 +432,16 @@ class Pi3(nn.Module):
         ms_patch_embeddings = self.ms_fusion(f_high_sampled, f_mid_sampled, f_low_sampled) # [B*N, Q, dec_embed_dim]
 
         # 3.3 Query Token embedding
-        token_sat = self.query_token_sat.unsqueeze(0).expand(B, 1, num_queries, -1)
-        token_grd = self.query_token_grd.unsqueeze(0).expand(B, N-1, num_queries, -1)
-        token_all = torch.cat([token_sat, token_grd], dim=1)
+        if is_sat_mask is not None:
+            mask_tok = is_sat_mask.to(hidden.device).view(B, N, 1, 1)
+            tok_sat_exp = self.query_token_sat.unsqueeze(0).expand(B, N, num_queries, -1)
+            tok_grd_exp = self.query_token_grd.unsqueeze(0).expand(B, N, num_queries, -1)
+            token_all = torch.where(mask_tok, tok_sat_exp, tok_grd_exp)
+        else:
+            token_sat = self.query_token_sat.unsqueeze(0).expand(B, 1, num_queries, -1)
+            token_grd = self.query_token_grd.unsqueeze(0).expand(B, N-1, num_queries, -1)
+            token_all = torch.cat([token_sat, token_grd], dim=1)
+
         token_all = token_all.reshape(B*N, num_queries, -1) # (B*N, Num_queries, dim)
 
         # 3.4 将位置编码、RGB patch embedding 和 Query token embedding 叠加，得到初始的 query_embeddings

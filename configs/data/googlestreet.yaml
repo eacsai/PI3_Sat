@@ -1,10 +1,10 @@
 # @package _global_
 
 train_dataset:
-    length: 17000         # dummy
+    length: 8000         # dummy
 
     weights: 
-        GoogleStreet: 17000
+        GoogleStreet: 8000
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset

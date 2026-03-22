@@ -78,7 +78,7 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
     return final_paths
 
 
-def _sample_query_uv(depth, Q=8192, edge_ratio=0.3):
+def _sample_query_uv(depth, rng, Q=8192, edge_ratio=0.3):
     """向量化地从深度图中采样 Q 个 query 点，偏重深度边缘，只在有效区域采样。
     
     若有效像素不足 Q 个，抛出 ValueError 让上层换数据。
@@ -103,7 +103,7 @@ def _sample_query_uv(depth, Q=8192, edge_ratio=0.3):
 
     # 从剩余 valid 像素中随机抽取 k_rand 个
     remain_local = np.delete(np.arange(valid_indices.size), edge_local)
-    rand_local = remain_local[np.random.choice(remain_local.size, size=k_rand, replace=False)]
+    rand_local = remain_local[rng.choice(remain_local.size, size=k_rand, replace=False)]
 
     sampled = valid_indices[np.concatenate([edge_local, rand_local])]
 
@@ -116,7 +116,7 @@ class GoogleStreetDataset(BaseDataset):
         self,
         data_root='/data/zhongyao/dataset',
         verbose=False,
-        split=True,
+        split=False,
         shift_range=20,
         **kwargs
     ):
@@ -127,43 +127,68 @@ class GoogleStreetDataset(BaseDataset):
         self.verbose = verbose
         self.dataset_label = 'googlestreet'
         mode = self.mode
-        if mode == 'train':
-            self.split = split
-        else:
-            self.split = False
-        self.file_paths = get_sorted_pair_paths(data_root, split=self.split, mode=mode)
+        self.file_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
         self.shift_range = shift_range 
         self.sat_height = 5726
-        self.sat_gap = 120
+        self.sat_gap = 60
 
     def __len__(self):
         return len(self.file_paths)
-                    
+
+    def natural_key(self, string: str):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', string)]
+
     def _get_views(self, index, resolution, rng):
+        n_views_target = 3
         if index >= len(self.file_paths):
             raise IndexError(f"Index {index} out of range. Dataset has {len(self.file_paths)} samples.")
+        folder_path = str(self.file_paths[index])
+        npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
 
-        if self.split:
-            parts = self.file_paths[index].split('/')
-            parts.insert(0, '/')
-            folder_path = os.path.join(*parts[:-1])
-            part = parts[-1]
-        else:
-            folder_path = str(self.file_paths[index])
-            part = '_1'
-
-        shift_east = np.random.uniform(-1, 1) * self.shift_range
-        shift_south = np.random.uniform(-1, 1) * self.shift_range
-
+        shift_east = rng.uniform(-1, 1) * self.shift_range
+        shift_south = rng.uniform(-1, 1) * self.shift_range
         current_sat_meters = rng.uniform(70, 210)
 
-        npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
-        if self.mode == 'train':
-            npy_configs = [f for f in npy_configs if part in f]
+        # Collect all candidate views in this folder, then sample an arbitrary
+        # satellite/ground/uav combination.
+        sat_files = [f for f in npy_configs if 'satellite' in f]
+        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f)]
+        uav_files = [f for f in npy_configs if 'uav' in f]
+
+        total_available = len(sat_files) + len(ground_files) + len(uav_files)
+        if total_available <= 0:
+            raise ValueError(f"[{self.dataset_label}] No valid *_rgb.npy views found under {folder_path}")
+
+        n_views = min(n_views_target, total_available)
+
+        sat_files_sorted = sorted(sat_files, key=self.natural_key)
+        ground_files_sorted = sorted(ground_files, key=self.natural_key)
+        uav_files_sorted = sorted(uav_files, key=self.natural_key)
+
+        if n_views == total_available:
+            sat_sel, ground_sel, uav_sel = sat_files_sorted, ground_files_sorted, uav_files_sorted
         else:
-            npy_configs = [f for f in npy_configs if f in ['ground_1_satellite_rgb.npy', 'ground_2_rgb.npy', 'uav_1_rgb.npy']]
-        
-        sorted_files = sorted(npy_configs, key=get_sort_priority)
+            feasible: list[tuple[int, int, int]] = []
+            for k_sat in range(1, min(len(sat_files_sorted), n_views) + 1):
+                for k_ground in range(0, min(len(ground_files_sorted), n_views - k_sat) + 1):
+                    k_uav = n_views - k_sat - k_ground
+                    if 0 <= k_uav <= len(uav_files_sorted):
+                        feasible.append((k_sat, k_ground, k_uav))
+            k_sat, k_ground, k_uav = feasible[rng.integers(len(feasible))]
+            sat_sel = rng.choice(sat_files_sorted, size=k_sat, replace=False).tolist() if k_sat > 0 else []
+            ground_sel = rng.choice(ground_files_sorted, size=k_ground, replace=False).tolist() if k_ground > 0 else []
+            uav_sel = rng.choice(uav_files_sorted, size=k_uav, replace=False).tolist() if k_uav > 0 else []
+
+
+        # Ordering rule:
+        # - Satellite views must be placed at the very front.
+        # - Ground/drone views are randomly mixed after satellites.
+        sat_part = sorted(sat_sel, key=self.natural_key)
+        grd_uav_part = list(ground_sel) + list(uav_sel)
+        rng.shuffle(grd_uav_part)  # random order among ground/uav only
+        sorted_files = sat_part + grd_uav_part
+        # Safety: enforce final length.
+        sorted_files = sorted_files[:n_views]
 
         # 分开存储：卫星视图 vs 地面/无人机视图
         satellite_views = []
@@ -254,14 +279,14 @@ class GoogleStreetDataset(BaseDataset):
             # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
             # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。
             is_sat = "satellite" in prefix
-            if is_sat:
-                tmp_sat_height = -c2w[1,3]
-                depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
+            # if is_sat:
+            #     tmp_sat_height = -c2w[1,3]
+            #     depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
 
             view_dict = dict(
                 img=rgb,
                 depthmap=depth.astype(np.float32),
-                query_uv=_sample_query_uv(depth.astype(np.float32)),
+                query_uv=_sample_query_uv(depth.astype(np.float32), rng),
                 camera_pose=c2w.astype(np.float32),
                 camera_intrinsics=K.astype(np.float32),
                 sat_gap=self.sat_gap,
@@ -281,9 +306,9 @@ class GoogleStreetDataset(BaseDataset):
 
         # 在各自列表内部打乱顺序
         if len(satellite_views) > 1:
-            random.shuffle(satellite_views)
+            rng.shuffle(satellite_views)
         if len(ground_drone_views) > 1:
-            random.shuffle(ground_drone_views)
+            rng.shuffle(ground_drone_views)
 
 
         # 可视化所有view在世界坐标系下的带颜色的点云，并保存为.ply文件

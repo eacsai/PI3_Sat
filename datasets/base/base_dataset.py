@@ -41,7 +41,9 @@ class BaseDataset(EasyDataset):
 
         self.use_sparse_depth = use_sparse_depth
 
-        self._rng = np.random.default_rng(seed)
+        self._rng_seed = int(seed)
+        self._epoch = 0
+        self._rng = np.random.default_rng(self._rng_seed)
         self._set_resolutions(resolution)
 
         self.aug_crop = aug_crop
@@ -65,6 +67,24 @@ class BaseDataset(EasyDataset):
         self.max_refetch = max_refetch
 
         self.random_sample_thres = random_sample_thres  # default not to do that
+
+    def set_epoch(self, epoch, base_seed=None):
+        """每个 epoch 更新一次；与 pi3_trainer.before_epoch 中 dataset.set_epoch 对齐。"""
+        if base_seed is not None:
+            self._rng_seed = int(base_seed)
+        self._epoch = int(epoch)
+        # 全局 rng：随 epoch 变化（用于未改为 per-index 的路径）
+        self._rng = np.random.default_rng(self._rng_seed + self._epoch * 7919)
+
+    def _rng_for_index(self, idx):
+        """同一 idx 在不同 epoch 使用不同 Generator；同一 epoch 内可复现。"""
+        if isinstance(idx, tuple):
+            idx0 = int(idx[0])
+        else:
+            idx0 = int(idx)
+        # 大质数混合，避免 epoch/idx 低位模式重叠
+        s = (self._rng_seed + self._epoch * 1000003 + idx0 * 9176) & 0xFFFFFFFFFFFFFFFF
+        return np.random.default_rng(s)
 
     def convert_attributes(self):
         """
@@ -196,19 +216,20 @@ class BaseDataset(EasyDataset):
         resolution = self._resolutions[ar_idx]  # DO NOT CHANGE THIS (compatible with BatchedRandomSampler)
         
         error = None
+        sample_rng = self._rng_for_index(idx)
         for _ in range(10):              # default: 3
             try:
-                views = self._get_views(idx, resolution, self._rng)
+                views = self._get_views(idx, resolution, sample_rng)
 
                 # 兼容新格式：_get_views 可能返回 dict{'satellite': [...], 'ground_drone': [...]}
-                if isinstance(views, dict):
-                    sat_list = views.get("satellite", []) or []
-                    gd_list = views.get("ground_drone", []) or []
-                    views = sat_list + gd_list
+                assert isinstance(views, dict), f"views should be a dict, but got {type(views)}"
+                sat_list = views.get("satellite", []) or []
+                gd_list = views.get("ground_drone", []) or []
+                views = sat_list + gd_list
 
                 # assert len(views) == self.frame_num
                 if self.shuffle:
-                    self._rng.shuffle(views)
+                    sample_rng.shuffle(views)
 
                 # check data-types
                 for v, view in enumerate(views):
@@ -230,8 +251,13 @@ class BaseDataset(EasyDataset):
                     assert np.isfinite(view['depthmap']).all(), f'NaN in depthmap for view {view_name(view)}'
                     view['z_far'] = self.z_far
                     if 'satellite' in view['label']:
+                        view['camera_pose_ori'] = view['camera_pose'] # cam2world
+                        camera_pose_new = view['camera_pose'].copy()
+                        min_pose_y = min(item['camera_pose'][1, 3] for item in gd_list)
+                        camera_pose_new[1,3] = min_pose_y - view['sat_gap']
+                        view['camera_pose_new'] = se3_inverse(camera_pose_new) # world2cam
                         pts3d, valid_mask = satellite_depthmap_to_absolute_camera_coordinates(**view)
-                        view['camera_pose'][1,3] = -view['sat_gap']
+                        view['camera_pose'] = camera_pose_new # cam2world
                     else:
                         pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
@@ -254,17 +280,6 @@ class BaseDataset(EasyDataset):
                 for view in views:
                     view['img'] = self.transform(view['img'])
 
-                # # last thing done!
-                # for view in views:
-                #     # transpose to make sure all views are the same size
-                #     # transpose_to_landscape(view)  # NOTE: Here we don't care about portrait image.
-                #     # this allows to check whether the RNG is is the same state each time
-                #     view['rng'] = int.from_bytes(self._rng.bytes(4), 'big')
-
-                # overlap = self.check_overlap(views)
-
-                # if overlap is False:
-                #     raise ValueError("Views are not overlapped!")
 
                 # # Visualize the point cloud
                 # all_pts = []

@@ -64,6 +64,11 @@ class MulDataset (EasyDataset):
     def _resolutions(self):
         return self.dataset._resolutions
 
+    def set_epoch(self, epoch, base_seed=None):
+        """转发给内部数据集，以便 BaseDataset 等能收到 epoch（用于 per-index RNG）。"""
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch, base_seed)
+
 
 class ResizedDataset (EasyDataset):
     """ Artifically changing the size of a dataset.
@@ -106,6 +111,10 @@ class ResizedDataset (EasyDataset):
         self._idxs_mapping = shuffled_idxs[:self.new_size]
 
         assert len(self._idxs_mapping) == self.new_size
+
+        # 让底层数据集（如 BaseDataset）同步 epoch，否则 _rng_for_index 永远用 _epoch=0
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch, base_seed)
 
     def __getitem__(self, idx):
         assert hasattr(self, '_idxs_mapping'), 'You need to call dataset.set_epoch() to use ResizedDataset.__getitem__()'

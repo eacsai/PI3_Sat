@@ -68,23 +68,27 @@ def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_
 
     return X_world, valid_mask
 
-def satellite_depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_pose, sat_gap, **kw):
+def satellite_depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_pose_ori, camera_pose_new, **kw):
     """
     Args:
         - depthmap (HxW array):
         - camera_intrinsics: a 3x3 matrix
-        - camera_pose: a 4x3 or 4x4 cam2world matrix
+        - camera_pose_ori: a 4x3 or 4x4 cam2world matrix
+        - camera_pose_new: a 4x3 or 4x4 world2cam matrix
     Returns:
         pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels."""
-    assert camera_pose is not None
-    R_cam2world = camera_pose[:3, :3]
-    t_cam2world = camera_pose[:3, 3]
+    assert camera_pose_ori is not None and camera_pose_new is not None
+    R_cam2world = camera_pose_ori[:3, :3]
+    t_cam2world = camera_pose_ori[:3, 3]
+    R_cam2world_new = camera_pose_new[:3, :3]
+    t_cam2world_new = camera_pose_new[:3, 3]
     X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
-    z_far_min = -t_cam2world[1] - sat_gap + 0.2
-    valid_mask = valid_mask & (depthmap > z_far_min) # z_far_min is the minimum depth for valid points
 
     # Express in absolute coordinates (invalid depth values)
     X_world = np.einsum("ik, vuk -> vui", R_cam2world, X_cam) + t_cam2world[None, None, :]
+    X_camera_new = np.einsum("ik, vuk -> vui", R_cam2world_new, X_world) + t_cam2world_new[None, None, :]
+    new_depthmap = X_camera_new[:, :, 2]
+    valid_mask = new_depthmap > 0 & valid_mask
 
     return X_world, valid_mask
 

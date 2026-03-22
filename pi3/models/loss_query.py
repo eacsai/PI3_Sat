@@ -1,4 +1,3 @@
-from re import I
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -128,8 +127,19 @@ class PointLoss(nn.Module):
         B = pred_local_pts.shape[0]
 
         weights_ = gt_local_pts[..., 2]
-        weights_ = weights_.clamp_min(0.1 * weighted_mean(weights_, valid_masks, dim=spatial_dims, keepdim=True))
+        weights_ = weights_.clamp_min(0.5 * weighted_mean(weights_, valid_masks, dim=spatial_dims, keepdim=True))
         weights_ = 1 / (weights_ + 1e-6)
+
+        # 卫星视图：深度 z 很大 → 1/z 权重过小。改为「与当前 batch 内最大深度权重相同」且该 view 内每个 query 权重相同。
+        if gt.get('is_sat_mask') is not None:
+            is_sat = gt['is_sat_mask'].to(device=weights_.device)
+            while is_sat.dim() < weights_.dim():
+                is_sat = is_sat.unsqueeze(-1)
+            is_sat = is_sat.expand_as(weights_)
+            # 当前张量上的全局最大权重（主要来自地面/无人机等小 z）
+            # max_w = weights_.amax(dim=spatial_dims, keepdim=True)
+            max_w = weights_.amax(dim=(1, *spatial_dims), keepdim=True).expand_as(weights_)
+            weights_ = torch.where(is_sat & valid_masks, max_w, weights_)
 
         # alignment (使用兼容版 ROE)
         with torch.no_grad():
@@ -342,8 +352,8 @@ class Pi3Loss(nn.Module):
         # 可视化：保存完整稠密点云（采样前）
         if self.save_vis:
             self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global_dense')
-            self.save_point_cloud_vis(gt_pts[:, :1], masks[:, :1], imgs[:, :1], prefix='gt_local_dense')
-            test_img = to_pil_image(imgs[0, 1])
+            self.save_point_cloud_vis(gt_pts[:, 2:3], masks[:, 2:3], imgs[:, 2:3], prefix='gt_local_dense')
+            test_img = to_pil_image(imgs[0, 2])
             test_img.save('test_img.png')
 
         # sample GT points and masks using query_uv coordinates
@@ -386,13 +396,18 @@ class Pi3Loss(nn.Module):
         if self.save_vis:
             self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global_sparse', query_uv=query_uv)
 
+        is_sat_mask = None
+        if 'is_satellite' in gt[0]:
+            is_sat_mask = torch.stack([view['is_satellite'] for view in gt], dim=1)
+
         return dict(
             imgs=imgs,
             global_points=gt_pts,
             local_points=gt_local_pts,
             valid_masks=masks,
             camera_poses=poses,
-            dataset_names=dataset_names
+            dataset_names=dataset_names,
+            is_sat_mask=is_sat_mask,
         )
     
     def normalize_pred(self, pred, gt):
