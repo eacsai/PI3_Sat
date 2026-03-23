@@ -293,7 +293,7 @@ class BaseTrainer:
 
                 # Forward pass
                 outputs = self.forward_batch(batch, mode='test')
-                outputs = self.calculate_loss(outputs, batch, mode='train')
+                outputs = self.calculate_loss(outputs, batch, mode='train', epoch=epoch)
                 loss = outputs.loss
 
                 # Gather statistics
@@ -346,7 +346,7 @@ class BaseTrainer:
                 batch = move_to_device(batch, device=self.accelerator.device)
                 with self.accelerator.autocast():
                     forward_output = self.forward_batch(batch, mode='train')
-                batch_output = self.calculate_loss(forward_output, batch, mode='train')
+                batch_output = self.calculate_loss(forward_output, batch, mode='train', epoch=epoch)
                 loss = batch_output.loss
                 if loss > self.cfg.train.clip_loss:
                     loss = loss * 0.0

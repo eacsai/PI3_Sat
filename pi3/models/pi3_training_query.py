@@ -18,6 +18,8 @@ from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
 from .query import DecoderBlock, PatchEmbeddingFast, ContinuousRoPE2D, MultiScaleQueryEmbedder
 
+MIN_MPP = 0.01
+MAX_MPP = 0.1
 
 def freeze_all_params(modules):
     for module in modules:
@@ -158,10 +160,15 @@ class Pi3(nn.Module):
         # ----------------------
         #  Local Points Decoder
         # ----------------------
-        self.query_point_head = nn.Sequential(
+        self.grd_point_head = nn.Sequential(
             nn.Linear(dec_embed_dim, 512),
             nn.GELU(),
             nn.Linear(512, 3)
+        )
+        self.sat_point_head = nn.Sequential(
+            nn.Linear(dec_embed_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 3)  # [修改] 从 3 改为 2：输出 (log_mpp, z)
         )
         # ----------------------
         #  Camera Pose Decoder
@@ -207,7 +214,7 @@ class Pi3(nn.Module):
             freeze_all_params([
                 self.encoder, self.decoder, self.query_pos_embedder, self.query_decoder,
                 self.query_norm, self.conv_head, self.ms_fusion, self.query_token_sat, self.query_token_grd, # <-- 更新这里
-                self.query_point_head,
+                self.grd_point_head, self.sat_point_head,
                 self.camera_decoder, self.camera_head, self.register_token
             ])
         else:
@@ -345,8 +352,13 @@ class Pi3(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs, queries=None, is_sat_mask: torch.Tensor | None = None,
-                dense: bool = False, isTrain: bool = True):  # [关键修改] 加入 queries 和 is_sat_mask 参数
+    def forward(self, 
+                imgs, 
+                is_sat_mask, 
+                queries=None,
+                dense: bool = False, 
+                isTrain: bool = True
+        ):  # [关键修改] 加入 queries 和 is_sat_mask 参数
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -479,24 +491,34 @@ class Pi3(nn.Module):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # local points
             point_hidden = point_hidden.float()
-            ret = self.query_point_head(point_hidden).reshape(B, N, query_per_view, -1)  # (B, N, Q, 3)
-
-            # 约定：
-            # - 卫星视图：ret 直接表示 xyz（与 pi3_training_sat 保持一致）
-            # - 非卫星视图：ret 表示 (xy, log_z)，用 exp(z) 保证深度为正，再投影到局部坐标
-            xy, z = ret.split([2, 1], dim=-1)          # (B, N, Q, 2), (B, N, Q, 1)
+            grd_ret = self.grd_point_head(point_hidden).reshape(B, N, query_per_view, -1)  # (B, N, Q, 3)
+            sat_ret = self.sat_point_head(point_hidden).reshape(B, N, query_per_view, -1)   # (B, N, Q, 2)
+            
+            # --- 非卫星视图 (保持不变) ---
+            xy, z = grd_ret.split([2, 1], dim=-1)
             z_pos = torch.exp(z)
-            grd_points_all = torch.cat([xy * z_pos, z_pos], dim=-1)  # (B, N, Q, 3)
-            sat_points_all = ret                                     # (B, N, Q, 3)
+            grd_points_all = torch.cat([xy * z_pos, z_pos], dim=-1)
 
-            if is_sat_mask is not None:
-                mask = is_sat_mask.to(ret.device).view(B, N, 1, 1)   # (B, N, 1, 1) bool
-                local_points = torch.where(mask, sat_points_all, grd_points_all)
-            else:
-                # 兼容旧逻辑：若未提供 mask，则假定第 0 个视图为卫星，其余为地面/无人机
-                sat_points = sat_points_all[:, 0:1]      # (B, 1, Q, 3)
-                grd_points = grd_points_all[:, 1:]       # (B, N-1, Q, 3)
-                local_points = torch.cat([sat_points, grd_points], dim=1)  # [B, N, Q, 3]
+            # --- 卫星视图 (正交缩放先验) ---
+            # Plan A
+            # sat_log_mpp, sat_z = sat_ret.split([1, 1], dim=-1)  # 拆分出对数缩放系数和高度
+            # sat_z_pos = torch.exp(sat_z)
+            # # [核心逻辑 1] 保证同一张图 meter_per_pixel 唯一：在 Q 维度上做全局平均池化
+            # global_log_mpp = sat_log_mpp.mean(dim=2, keepdim=True) # (B, N, 1, 1)
+            # sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_log_mpp) # 使用 exp 保证物理缩放系数必须为正数
+
+            # # [核心逻辑 2] 计算 XY：(U, V) - 0.5 是为了把相机原点定在图像正中心
+            # queries_view = queries.reshape(B, N, query_per_view, 2) # (B, N, Q, 2)
+            # wh = torch.tensor([W, H], dtype=sat_mpp.dtype, device=sat_mpp.device).view(1, 1, 1, 2)
+            # sat_xy = (queries_view - 0.5) * wh * sat_mpp # 精确的几何反投影
+            # sat_points_all = torch.cat([sat_xy, sat_z], dim=-1)  # (B, N, Q, 3)                               # (B, N, Q, 3)
+            
+            # Plan B
+            sat_xy, sat_z = sat_ret.split([2, 1], dim=-1)
+            sat_points_all = torch.cat([sat_xy, sat_z], dim=-1)  # (B, N, Q, 3)
+
+            mask = is_sat_mask.to(grd_ret.device).view(B, N, 1, 1)   # (B, N, 1, 1) bool
+            local_points = torch.where(mask, sat_points_all, grd_points_all)
 
             # confidence
             if self.train_conf:

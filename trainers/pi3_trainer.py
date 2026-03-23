@@ -100,13 +100,13 @@ class Pi3Trainer(BaseTrainer):
 
         return [pred, batch]
     
-    def calculate_loss(self, output, batch, mode='train'):
+    def calculate_loss(self, output, batch, mode='train', epoch=None):
         output, batch = output
 
         if mode == 'train':
-            loss, details = self.train_loss(output, batch)
+            loss, details = self.train_loss(output, batch, epoch=epoch)
         else:
-            loss, details = self.test_loss(output, batch)
+            loss, details = self.test_loss(output, batch, epoch=epoch)
 
         return EasyDict(
             loss=loss,

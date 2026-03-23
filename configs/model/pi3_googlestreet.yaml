@@ -17,10 +17,12 @@ loss:
     train_loss: 
         _target_: pi3.models.loss_query.Pi3Loss
         train_conf: false
+        normal_loss_start_epoch: 0   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
 
     test_loss:
         _target_: pi3.models.loss_query.Pi3Loss
         train_conf: false
+        normal_loss_start_epoch: 0   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
 
 train:
     # TODO: DEBUG CHANGE

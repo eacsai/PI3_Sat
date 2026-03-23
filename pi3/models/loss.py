@@ -382,7 +382,7 @@ class Pi3Loss(nn.Module):
 
         return pred
 
-    def forward(self, pred, gt_raw):
+    def forward(self, pred, gt_raw, epoch=None):
         gt_normalized = self.prepare_gt(gt_raw)
         pred_normalized = self.normalize_pred(pred, gt_normalized)
 

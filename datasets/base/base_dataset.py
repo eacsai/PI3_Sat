@@ -33,6 +33,7 @@ class BaseDataset(EasyDataset):
         shuffle=True,
         use_sparse_depth=False,
         use_query=True,
+        query_sample_count=8192,
     ):
         super().__init__()
         self.frame_num = frame_num
@@ -71,7 +72,7 @@ class BaseDataset(EasyDataset):
         self.random_sample_thres = random_sample_thres  # default not to do that
 
         self.use_query = use_query
-
+        self.query_sample_count = query_sample_count
     def set_epoch(self, epoch, base_seed=None):
         """每个 epoch 更新一次；与 pi3_trainer.before_epoch 中 dataset.set_epoch 对齐。"""
         if base_seed is not None:
@@ -284,7 +285,7 @@ class BaseDataset(EasyDataset):
                 for view in views:
                     view['img'] = self.transform(view['img'])
                     if self.use_query:
-                        view['query_uv'] = sample_query_uv(view['depthmap'], view['valid_mask'], sample_rng)
+                        view['query_uv'] = sample_query_uv(view['depthmap'], view['valid_mask'], sample_rng, Q=self.query_sample_count)
                     else:
                         view['is_satellite'] = None
                 # # Visualize the point cloud

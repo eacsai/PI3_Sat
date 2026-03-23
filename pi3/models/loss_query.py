@@ -38,10 +38,20 @@ def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-12):
 # ---------------------------------------------------------------------------
 
 class PointLoss(nn.Module):
-    def __init__(self, local_align_res=4096, train_conf=False, expected_dist_thresh=0.02):
+    def __init__(
+        self,
+        local_align_res=4096,
+        train_conf=False,
+        expected_dist_thresh=0.02,
+        query_normal_loss_weight: float = 0.5,
+        normal_loss_start_epoch: int = 5,
+    ):
         super().__init__()
         self.local_align_res = local_align_res
         self.criteria_local = nn.L1Loss(reduction='none')
+        self.query_normal_loss_weight = float(query_normal_loss_weight)
+        # 0-based：默认前 5 个 epoch（0~4）不反传法向 loss，从第 6 个 epoch（epoch==5）开始计算
+        self.normal_loss_start_epoch = int(normal_loss_start_epoch)
 
         self.train_conf = train_conf
         if self.train_conf:
@@ -116,7 +126,7 @@ class PointLoss(nn.Module):
         loss = loss.mean() / (4 * max(points.shape[-3:-1]))
         return loss
 
-    def forward(self, pred, gt):
+    def forward(self, pred, gt, epoch: Optional[int] = None):
         pred_local_pts = pred['local_points']
         gt_local_pts = gt['local_points']
         valid_masks = gt['valid_masks']
@@ -264,9 +274,15 @@ class Pi3Loss(nn.Module):
         train_conf=False,
         save_vis=False,
         save_vis_dir='data/vis_ply',
+        query_normal_loss_weight: float = 0.5,
+        normal_loss_start_epoch: int = 5,
     ):
         super().__init__()
-        self.point_loss = PointLoss(train_conf=train_conf)
+        self.point_loss = PointLoss(
+            train_conf=train_conf,
+            query_normal_loss_weight=query_normal_loss_weight,
+            normal_loss_start_epoch=normal_loss_start_epoch,
+        )
         self.camera_loss = CameraLoss()
 
         self.save_vis = save_vis
@@ -455,7 +471,7 @@ class Pi3Loss(nn.Module):
 
         return pred
 
-    def forward(self, pred, gt_raw):
+    def forward(self, pred, gt_raw, epoch: Optional[int] = None):
         gt_normalized = self.prepare_gt(gt_raw, query_uv=pred['query_uv'])
         pred_normalized = self.normalize_pred(pred, gt_normalized)
 
@@ -463,7 +479,7 @@ class Pi3Loss(nn.Module):
         details = dict()
 
         # Local Point Loss
-        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized)
+        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized, epoch=epoch)
         final_loss += point_loss
         details.update(point_loss_details)
 
