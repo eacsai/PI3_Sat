@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 from .transforms import *
 import pandas as pd
 from .utils import *
-from datasets.query import sample_query_uv
+from datasets.query import sample_query_uv, sample_query_uv_with_patches
 
 import plyfile
 from plyfile import PlyData, PlyElement
@@ -34,6 +34,7 @@ class BaseDataset(EasyDataset):
         use_sparse_depth=False,
         use_query=True,
         query_sample_count=8192,
+        patch_size=0,
     ):
         super().__init__()
         self.frame_num = frame_num
@@ -73,6 +74,7 @@ class BaseDataset(EasyDataset):
 
         self.use_query = use_query
         self.query_sample_count = query_sample_count
+        self.patch_size = patch_size
     def set_epoch(self, epoch, base_seed=None):
         """每个 epoch 更新一次；与 pi3_trainer.before_epoch 中 dataset.set_epoch 对齐。"""
         if base_seed is not None:
@@ -285,7 +287,21 @@ class BaseDataset(EasyDataset):
                 for view in views:
                     view['img'] = self.transform(view['img'])
                     if self.use_query:
-                        view['query_uv'] = sample_query_uv(view['depthmap'], view['valid_mask'], sample_rng, Q=self.query_sample_count)
+                        if self.patch_size >= 3:
+                            uv, n_patches = sample_query_uv_with_patches(
+                                view['depthmap'], view['valid_mask'], sample_rng,
+                                Q=self.query_sample_count, patch_size=self.patch_size,
+                            )
+                            view['query_uv'] = uv
+                            view['n_patches'] = n_patches
+                            view['patch_size'] = self.patch_size
+                        else:
+                            view['query_uv'] = sample_query_uv(
+                                view['depthmap'], view['valid_mask'], sample_rng,
+                                Q=self.query_sample_count,
+                            )
+                            view['n_patches'] = 0
+                            view['patch_size'] = 0
                     else:
                         view['is_satellite'] = None
                 # # Visualize the point cloud

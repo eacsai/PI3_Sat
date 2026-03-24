@@ -43,7 +43,7 @@ class PointLoss(nn.Module):
         local_align_res=4096,
         train_conf=False,
         expected_dist_thresh=0.02,
-        query_normal_loss_weight: float = 0.5,
+        query_normal_loss_weight: float = 0.01,
         normal_loss_start_epoch: int = 5,
     ):
         super().__init__()
@@ -126,6 +126,82 @@ class PointLoss(nn.Module):
         loss = loss.mean() / (4 * max(points.shape[-3:-1]))
         return loss
 
+    # ------------------------------------------------------------------
+    # 微面片法向量损失
+    # ------------------------------------------------------------------
+    def _patch_normal_loss(self, pred_pts, gt_pts, masks, n_patches, patch_size=3):
+        """从 3×3 微面片的有限差分计算法向量损失。
+
+        pred_pts / gt_pts : (B, N, Q, 3)
+        masks             : (B, N, Q)
+        前 n_patches * patch_size² 个 query 按连续分组排列，
+        每组 patch_size² 个点构成一个行优先的 (patch_size, patch_size) 面片。
+        """
+        B, N, Q, _ = pred_pts.shape
+        ps = patch_size
+        pp = n_patches * ps * ps
+        if pp > Q:
+            return pred_pts.new_zeros(())
+
+        # reshape 成 (B, N, n_patches, ps, ps, 3)
+        pred_p = pred_pts[:, :, :pp].reshape(B, N, n_patches, ps, ps, 3)
+        gt_p   = gt_pts[:, :, :pp].reshape(B, N, n_patches, ps, ps, 3)
+        mask_p = masks[:, :, :pp].reshape(B, N, n_patches, ps, ps)
+
+        c = ps // 2  # 中心索引 = 1（patch_size=3 时）
+
+        # 中心差分 → 预测法向
+        pred_dx = pred_p[:, :, :, c, c + 1, :] - pred_p[:, :, :, c, c - 1, :]
+        pred_dy = pred_p[:, :, :, c + 1, c, :] - pred_p[:, :, :, c - 1, c, :]
+        pred_n  = torch.cross(pred_dx, pred_dy, dim=-1)
+        pred_n  = F.normalize(pred_n, dim=-1, eps=1e-8)
+
+        # 中心差分 → GT 法向
+        gt_dx = gt_p[:, :, :, c, c + 1, :] - gt_p[:, :, :, c, c - 1, :]
+        gt_dy = gt_p[:, :, :, c + 1, c, :] - gt_p[:, :, :, c - 1, c, :]
+        gt_n  = torch.cross(gt_dx, gt_dy, dim=-1)
+        gt_n  = F.normalize(gt_n, dim=-1, eps=1e-8)
+
+        # 有效性掩码：中心 + 上下左右 4 邻域全 valid
+        valid = (mask_p[:, :, :, c, c]
+               & mask_p[:, :, :, c, c - 1] & mask_p[:, :, :, c, c + 1]
+               & mask_p[:, :, :, c - 1, c] & mask_p[:, :, :, c + 1, c])
+
+        # 深度边缘过滤：邻域 z 与中心 z 偏差 > 3% 则视为边缘，跳过
+        z_c = gt_p[:, :, :, c, c, 2]
+        z_nb = torch.stack([
+            gt_p[:, :, :, c, c - 1, 2], gt_p[:, :, :, c, c + 1, 2],
+            gt_p[:, :, :, c - 1, c, 2], gt_p[:, :, :, c + 1, c, 2],
+        ], dim=-1)
+        not_edge = ((z_nb / (z_c.unsqueeze(-1) + 1e-8) - 1.0).abs() < 0.03).all(dim=-1)
+        
+        # 粗糙度过滤: 算一下中心点到四个邻居的高度差的方差，或者直接看 GT 内部深度的起伏
+        z_patch = gt_p[..., 2] # shape: (B, N, n_patches, 3, 3)
+        # 只在每个 patch 的空间维(3x3)上计算方差，保留 n_patches 维
+        z_max = z_patch.amax(dim=(-2, -1)) # shape: (B, N, n_patches)
+        z_min = z_patch.amin(dim=(-2, -1))
+        z_diff = z_max - z_min
+        # DEBUG: 打印 z_diff 的统计信息
+        # diff_flat = z_diff.detach().flatten()
+        # print(f"\n[Patch Z-Diff Stat] "
+        #         f"Mean: {diff_flat.mean().item():.4f}, "
+        #         f"Median: {diff_flat.median().item():.4f}, "
+        #         f"90%: {torch.quantile(diff_flat, 0.90).item():.4f}, "
+        #         f"95%: {torch.quantile(diff_flat, 0.95).item():.4f}")
+
+        # 内部高度差超过了某个值（比如归一化尺度的 0.05），就认为是粗糙的树木。
+        is_smooth_surface = z_diff < 0.15  # 这个 0.15 比方差的 0.01 好调得多！
+
+        valid = valid & not_edge & is_smooth_surface
+        if not valid.any():
+            return pred_pts.new_zeros(())
+
+        # 1 − |cos(pred, gt)| ：处理法向正负号歧义
+        cos_sim = (pred_n * gt_n).sum(dim=-1)
+        loss = (1.0 - cos_sim.abs()) * valid.float()
+        return loss.sum() / (valid.sum().float() + 1e-8)
+
+    # ------------------------------------------------------------------
     def forward(self, pred, gt, epoch: Optional[int] = None):
         pred_local_pts = pred['local_points']
         gt_local_pts = gt['local_points']
@@ -137,18 +213,18 @@ class PointLoss(nn.Module):
         B = pred_local_pts.shape[0]
 
         weights_ = gt_local_pts[..., 2]
-        weights_ = weights_.clamp_min(0.5 * weighted_mean(weights_, valid_masks, dim=spatial_dims, keepdim=True))
+        # TODO: 检查这个weights_是不是对的
+        weights_ = weights_.clamp_min(0.3 * weighted_mean(weights_, valid_masks, dim=spatial_dims, keepdim=True))
         weights_ = 1 / (weights_ + 1e-6)
 
-        # 卫星视图：深度 z 很大 → 1/z 权重过小。改为「与当前 batch 内最大深度权重相同」且该 view 内每个 query 权重相同。
         if gt.get('is_sat_mask') is not None:
             is_sat = gt['is_sat_mask'].to(device=weights_.device)
             while is_sat.dim() < weights_.dim():
                 is_sat = is_sat.unsqueeze(-1)
             is_sat = is_sat.expand_as(weights_)
+            max_w = weights_.amax(dim=spatial_dims, keepdim=True)
             # 当前张量上的全局最大权重（主要来自地面/无人机等小 z）
-            # max_w = weights_.amax(dim=spatial_dims, keepdim=True)
-            max_w = weights_.amax(dim=(1, *spatial_dims), keepdim=True).expand_as(weights_)
+            # max_w = weights_.amax(dim=(1, *spatial_dims), keepdim=True).expand_as(weights_) * 0.1
             weights_ = torch.where(is_sat & valid_masks, max_w, weights_)
 
         # alignment (使用兼容版 ROE)
@@ -186,11 +262,31 @@ class PointLoss(nn.Module):
         final_loss += local_pts_loss.mean()
         details['local_pts_loss'] = local_pts_loss.mean()
 
-        # normal loss
-        normal_loss = 0.0 * aligned_local_pts.mean()
-        details['normal_loss'] = normal_loss.mean() if isinstance(normal_loss, torch.Tensor) else normal_loss
+        # ---- patch-based normal loss ----
+        n_patches = gt.get('n_patches', 0)
+        if isinstance(n_patches, torch.Tensor):
+            n_patches = int(n_patches.flatten()[0].item())
+        patch_size = gt.get('patch_size', 3)
+        if isinstance(patch_size, torch.Tensor):
+            patch_size = int(patch_size.flatten()[0].item())
 
-        # [Optional] Global Point Loss
+        should_compute_normal = (
+            n_patches > 0
+            and self.query_normal_loss_weight > 0
+            and (epoch is None or epoch >= self.normal_loss_start_epoch)
+        )
+
+        if should_compute_normal:
+            normal_loss = self._patch_normal_loss(
+                aligned_local_pts, gt_local_pts, valid_masks,
+                n_patches=n_patches, patch_size=patch_size,
+            )
+            final_loss += self.query_normal_loss_weight * normal_loss
+            details['normal_loss'] = self.query_normal_loss_weight * normal_loss.detach()
+        else:
+            details['normal_loss'] = aligned_local_pts.new_zeros(())
+
+        # ---- [Optional] Global Point Loss ----
         if 'global_points' in pred and pred['global_points'] is not None:
             gt_pts = gt['global_points']
             pred_global_pts = pred['global_points'] * S_opt_local.view(B, 1, 1, 1)
@@ -274,7 +370,7 @@ class Pi3Loss(nn.Module):
         train_conf=False,
         save_vis=False,
         save_vis_dir='data/vis_ply',
-        query_normal_loss_weight: float = 0.5,
+        query_normal_loss_weight: float = 0.01,
         normal_loss_start_epoch: int = 5,
     ):
         super().__init__()
@@ -416,6 +512,16 @@ class Pi3Loss(nn.Module):
         if 'is_satellite' in gt[0]:
             is_sat_mask = torch.stack([view['is_satellite'] for view in gt], dim=1)
 
+        # 微面片元信息（由 dataset 提供，collate 后变为 (B,) tensor）
+        n_patches = 0
+        if 'n_patches' in gt[0]:
+            val = gt[0]['n_patches']
+            n_patches = int(val.flatten()[0].item()) if isinstance(val, torch.Tensor) else int(val)
+        patch_size = 3
+        if 'patch_size' in gt[0]:
+            val = gt[0]['patch_size']
+            patch_size = int(val.flatten()[0].item()) if isinstance(val, torch.Tensor) else int(val)
+
         return dict(
             imgs=imgs,
             global_points=gt_pts,
@@ -424,6 +530,8 @@ class Pi3Loss(nn.Module):
             camera_poses=poses,
             dataset_names=dataset_names,
             is_sat_mask=is_sat_mask,
+            n_patches=n_patches,
+            patch_size=patch_size,
         )
     
     def normalize_pred(self, pred, gt):

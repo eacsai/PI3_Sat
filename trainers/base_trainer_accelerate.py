@@ -293,7 +293,7 @@ class BaseTrainer:
 
                 # Forward pass
                 outputs = self.forward_batch(batch, mode='test')
-                outputs = self.calculate_loss(outputs, batch, mode='train', epoch=epoch)
+                outputs = self.calculate_loss(outputs, batch, mode='test', epoch=epoch)
                 loss = outputs.loss
 
                 # Gather statistics

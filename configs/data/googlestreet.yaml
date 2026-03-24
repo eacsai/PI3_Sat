@@ -15,6 +15,7 @@ train_dataset:
         frame_num: 3
         aug_crop: 16
         use_query: true
+        patch_size: 3
         transform:
             _partial_: true
             _target_: datasets.base.transforms.JitterJpegLossBlurring
@@ -38,6 +39,7 @@ test_dataset:
         z_far: 30000
         frame_num: 3
         use_query: true
+        patch_size: 3
         resolution:
             - [252, 252]
         transform:

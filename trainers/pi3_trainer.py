@@ -11,7 +11,7 @@ class Pi3Trainer(BaseTrainer):
         super().__init__(cfg)
 
         self.train_loss = hydra.utils.instantiate(cfg.loss.train_loss)
-        self.test_loss = hydra.utils.instantiate(cfg.loss.train_loss)
+        self.test_loss = hydra.utils.instantiate(cfg.loss.test_loss)
 
     def build_optimizer(self, cfg_optimizer, model):
         def param_group_fn(model_):
