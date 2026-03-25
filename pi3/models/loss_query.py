@@ -217,15 +217,29 @@ class PointLoss(nn.Module):
         weights_ = weights_.clamp_min(0.3 * weighted_mean(weights_, valid_masks, dim=spatial_dims, keepdim=True))
         weights_ = 1 / (weights_ + 1e-6)
 
-        if gt.get('is_sat_mask') is not None:
-            is_sat = gt['is_sat_mask'].to(device=weights_.device)
-            while is_sat.dim() < weights_.dim():
-                is_sat = is_sat.unsqueeze(-1)
-            is_sat = is_sat.expand_as(weights_)
-            max_w = weights_.amax(dim=spatial_dims, keepdim=True)
-            # 当前张量上的全局最大权重（主要来自地面/无人机等小 z）
-            # max_w = weights_.amax(dim=(1, *spatial_dims), keepdim=True).expand_as(weights_) * 0.1
-            weights_ = torch.where(is_sat & valid_masks, max_w, weights_)
+
+        is_sat = gt['is_sat_mask'].to(device=weights_.device)
+        while is_sat.dim() < weights_.dim():
+            is_sat = is_sat.unsqueeze(-1)
+        is_sat = is_sat.expand_as(weights_)
+
+        non_sat = ~is_sat
+        non_sat_valid = non_sat & valid_masks
+
+        # 只用地面/无人机有效区域计算平均权重（按 batch 单独计算）
+        non_sat_sum = (weights_ * non_sat_valid.float()).sum(dim=spatial_dims, keepdim=True)
+        non_sat_cnt = non_sat_valid.float().sum(dim=spatial_dims, keepdim=True)
+        non_sat_mean = non_sat_sum / (non_sat_cnt + 1e-6)
+
+        # 若某个 batch 恰好没有 non-sat 有效像素，则回退到该 batch 的全局有效均值
+        all_sum = (weights_ * valid_masks.float()).sum(dim=spatial_dims, keepdim=True)
+        all_cnt = valid_masks.float().sum(dim=spatial_dims, keepdim=True)
+        all_mean = all_sum / (all_cnt + 1e-6)
+        non_sat_mean = torch.where(non_sat_cnt > 0, non_sat_mean, all_mean)
+
+        # 卫星图：有效区域赋 non-sat 平均值；无效区域置 0
+        sat_weights = torch.where(valid_masks, non_sat_mean.expand_as(weights_), torch.zeros_like(weights_))
+        weights_ = torch.where(is_sat, sat_weights, weights_)
 
         # alignment (使用兼容版 ROE)
         with torch.no_grad():
@@ -464,8 +478,8 @@ class Pi3Loss(nn.Module):
         # 可视化：保存完整稠密点云（采样前）
         if self.save_vis:
             self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global_dense')
-            self.save_point_cloud_vis(gt_pts[:, 2:3], masks[:, 2:3], imgs[:, 2:3], prefix='gt_local_dense')
-            test_img = to_pil_image(imgs[0, 2])
+            self.save_point_cloud_vis(gt_pts[:, 0:1], masks[:, 0:1], imgs[:, 0:1], prefix='gt_local_dense')
+            test_img = to_pil_image(imgs[0, 0])
             test_img.save('test_img.png')
 
         # sample GT points and masks using query_uv coordinates

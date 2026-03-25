@@ -502,7 +502,7 @@ class Pi3(nn.Module):
             # --- 卫星视图 (正交缩放先验) ---
             # Plan A
             sat_log_mpp, sat_z = sat_ret.split([1, 1], dim=-1)  # 拆分出对数缩放系数和高度
-            # sat_z_pos = torch.exp(sat_z)
+            sat_z_pos = torch.exp(sat_z)
             # [核心逻辑 1] 保证同一张图 meter_per_pixel 唯一：在 Q 维度上做全局平均池化
             global_log_mpp = sat_log_mpp.mean(dim=2, keepdim=True) # (B, N, 1, 1)
             sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_log_mpp) # 使用 exp 保证物理缩放系数必须为正数
@@ -511,7 +511,7 @@ class Pi3(nn.Module):
             queries_view = queries.reshape(B, N, query_per_view, 2) # (B, N, Q, 2)
             wh = torch.tensor([W, H], dtype=sat_mpp.dtype, device=sat_mpp.device).view(1, 1, 1, 2)
             sat_xy = (queries_view - 0.5) * wh * sat_mpp # 精确的几何反投影
-            sat_points_all = torch.cat([sat_xy, sat_z], dim=-1)  # (B, N, Q, 3)                               # (B, N, Q, 3)
+            sat_points_all = torch.cat([sat_xy, sat_z_pos], dim=-1)  # (B, N, Q, 3)                               # (B, N, Q, 3)
             
             # Plan B
             # sat_xy, sat_z = sat_ret.split([2, 1], dim=-1)
