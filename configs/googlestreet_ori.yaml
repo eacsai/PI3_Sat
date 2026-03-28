@@ -2,7 +2,7 @@
 
 defaults:
   - model: pi3_googlestreet_ori.yaml
-  - train: train_pi3_lowres_megadepth
+  - train: train_pi3_lowres_ori
   - data: googlestreet_ori.yaml
   - general: googlestreet_ori.yaml
   - extras: default.yaml

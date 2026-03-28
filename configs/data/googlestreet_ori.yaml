@@ -1,10 +1,10 @@
 # @package _global_
 
 train_dataset:
-    length: 8000         # dummy
+    length: 39000         # 8000 Original and 39000 All
 
     weights: 
-        GoogleStreet: 8000
+        GoogleStreet: 39000  # 8000 Original and 39000 All
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
@@ -21,6 +21,7 @@ train_dataset:
         aug_focal: 0.9
         mode: 'train'
         shuffle: false
+        query_sample_count: 8192
 
 train_dataloader:
     drop_last: True
@@ -45,9 +46,8 @@ test_dataset:
             _target_: datasets.base.transforms.ImgToTensor
         mode: 'test'
         shuffle: false
+        query_sample_count: 8192
 
 test_dataloader:
     drop_last: False
     shuffle: False
-
-# HYDRA_FULL_ERROR=1

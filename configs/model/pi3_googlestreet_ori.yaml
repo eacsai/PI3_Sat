@@ -15,17 +15,19 @@ loss:
     train_loss: 
         _target_: pi3.models.loss.Pi3Loss
         train_conf: false
+        normal_loss_start_epoch: 5   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
 
     test_loss:
         _target_: pi3.models.loss.Pi3Loss
         train_conf: false
+        normal_loss_start_epoch: 0   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
 
 train:
     # TODO: DEBUG CHANGE
     num_workers: 4 # debug use 0
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 500
-    iters_per_epoch: 220
+    num_epoch: 30
+    iters_per_epoch: 555   # 110 Original and 555 All
 
     print_freq: 10
     base_seed: 666

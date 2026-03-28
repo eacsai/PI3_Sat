@@ -37,11 +37,11 @@ def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-12):
 # ---------------------------------------------------------------------------
 
 class PointLoss(nn.Module):
-    def __init__(self, local_align_res=4096, train_conf=False, expected_dist_thresh=0.02):
+    def __init__(self, local_align_res=4096, train_conf=False, expected_dist_thresh=0.02, normal_loss_start_epoch: int = 5):
         super().__init__()
         self.local_align_res = local_align_res
         self.criteria_local = nn.L1Loss(reduction='none')
-
+        self.normal_loss_start_epoch = int(normal_loss_start_epoch)
         self.train_conf = train_conf
         if self.train_conf:
             self.prepare_segformer()
@@ -112,7 +112,7 @@ class PointLoss(nn.Module):
 
         return loss
 
-    def forward(self, pred, gt):
+    def forward(self, pred, gt, epoch: Optional[int] = None):
         pred_local_pts = pred['local_points']
         gt_local_pts = gt['local_points']
         valid_masks = gt['valid_masks']
@@ -160,14 +160,13 @@ class PointLoss(nn.Module):
         final_loss += local_pts_loss.mean()
         details['local_pts_loss'] = local_pts_loss.mean()
 
-        # normal loss
-        normal_batch_id = [i for i in range(len(gt['dataset_names'])) if gt['dataset_names'][i] in __HIGH_QUALITY_DATASETS__ + __MIDDLE_QUALITY_DATASETS__]
-        if len(normal_batch_id) == 0:
-            normal_loss =  0.0 * aligned_local_pts.mean()
-        else:
-            normal_loss = self.noraml_loss(aligned_local_pts[normal_batch_id], gt_local_pts[normal_batch_id], valid_masks[normal_batch_id])
+        # normal loss2
+        if epoch is None or epoch >= self.normal_loss_start_epoch:
+            normal_loss = self.noraml_loss(aligned_local_pts, gt_local_pts, valid_masks)
             final_loss += normal_loss.mean()
-        details['normal_loss'] = normal_loss.mean()
+            details['normal_loss'] = normal_loss.mean()
+        else:
+            details['normal_loss'] = aligned_local_pts.new_zeros(())
 
         # [Optional] Global Point Loss
         if 'global_points' in pred and pred['global_points'] is not None:
@@ -254,9 +253,13 @@ class Pi3Loss(nn.Module):
         train_conf=False,
         save_vis=False,
         save_vis_dir='data/vis_ply',
+        normal_loss_start_epoch: int = 5,
     ):
         super().__init__()
-        self.point_loss = PointLoss(train_conf=train_conf)
+        self.point_loss = PointLoss(
+            train_conf=train_conf,
+            normal_loss_start_epoch=normal_loss_start_epoch,
+        )
         self.camera_loss = CameraLoss()
 
         self.save_vis = save_vis
@@ -382,7 +385,7 @@ class Pi3Loss(nn.Module):
 
         return pred
 
-    def forward(self, pred, gt_raw, epoch=None):
+    def forward(self, pred, gt_raw, epoch: Optional[int] = None):
         gt_normalized = self.prepare_gt(gt_raw)
         pred_normalized = self.normalize_pred(pred, gt_normalized)
 
@@ -449,7 +452,7 @@ class Pi3Loss(nn.Module):
         #     plt.close()
 
         # Local Point Loss
-        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized)
+        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized, epoch=epoch)
         final_loss += point_loss
         details.update(point_loss_details)
 

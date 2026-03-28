@@ -6,7 +6,6 @@ import os
 import numpy as np
 import os.path as osp
 from PIL import Image
-import torchvision.transforms.functional as TF
 from datasets.base.transforms import *
 import json
 from tqdm import tqdm
@@ -44,13 +43,27 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
     
     if mode == 'train':
         target_suffixes = ('0001_pair', '0004_pair', '0005_pair', '0007_pair', '0008_pair', '0012_pair', '0016_pair', '0017_pair', '0022_pair', '0023_pair', '0025_pair', '0027_pair', '0032_pair', '0035_pair', '0036_pair', '0056_pair', '0057_pair')
+        # exclude_suffixes = (
+        #     '0013_pair', '0516_pair', '0515_pair', '0512_pair', '0508_pair', 
+        #     ' 0507_pair', '0506_pair', '0505_pair', '0503_pair', '0502_pair', 
+        #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
+        #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
+        # )
+        exclude_suffixes = ('0013_pair')
     else:
         target_suffixes = ('0013_pair',)
 
     for l1_name in level1_names:
-        if not l1_name.endswith(target_suffixes):
-            continue
-            
+        if mode == 'train':
+            if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
+                continue
+        else:
+            if not l1_name.endswith(target_suffixes):
+                continue
+
+        # if not l1_name.endswith(target_suffixes):
+        #     continue
+
         l1_path = os.path.join(root_dir, l1_name)
         level2_names = sorted([d for d in os.listdir(l1_path) if os.path.isdir(os.path.join(l1_path, d))])
         
@@ -98,6 +111,11 @@ class GoogleStreetDataset(BaseDataset):
         self.shift_range = shift_range 
         self.sat_height = 5726
         self.sat_gap = 60
+        # 训练时每个样本都 listdir 会放大随机读与元数据开销；启动时扫一次并缓存。
+        paths_iter = tqdm(self.file_paths, desc='[GoogleStreet] 索引各目录 *_rgb.npy') if verbose else self.file_paths
+        self._rgb_npy_names_per_sample = [
+            [f for f in os.listdir(fp) if f.endswith('_rgb.npy')] for fp in paths_iter
+        ]
 
     def __len__(self):
         return len(self.file_paths)
@@ -110,7 +128,7 @@ class GoogleStreetDataset(BaseDataset):
         if index >= len(self.file_paths):
             raise IndexError(f"Index {index} out of range. Dataset has {len(self.file_paths)} samples.")
         folder_path = str(self.file_paths[index])
-        npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
+        npy_configs = self._rgb_npy_names_per_sample[index]
 
         shift_east = rng.uniform(-1, 1) * self.shift_range
         shift_south = rng.uniform(-1, 1) * self.shift_range
@@ -119,7 +137,7 @@ class GoogleStreetDataset(BaseDataset):
         # Collect all candidate views in this folder, then sample an arbitrary
         # satellite/ground/uav combination.
         sat_files = [f for f in npy_configs if 'satellite' in f]
-        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f)]
+        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f and 'pano' not in f)]
         uav_files = [f for f in npy_configs if 'uav' in f]
 
         total_available = len(sat_files) + len(ground_files) + len(uav_files)
@@ -181,71 +199,88 @@ class GoogleStreetDataset(BaseDataset):
                     depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
                 else:
                     depth = temp_depth_tensor.detach().numpy().astype(np.float32)
-                    depth[depth > 60] = -1
+                # depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
+                depth[depth > 60] = -1
             else:
                 depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
-
-            # C. 安全加载并裁剪 RGB 图像
+                if 'uav' in prefix:
+                    depth[depth > 300] = -1
+            # C. 加载 RGB：JPEG 统一走 cv2 解码；卫星图在 ndarray 上裁剪 + LANCZOS4 缩放（对齐原 PIL LANCZOS 思路）
             rgb_file = f"{prefix}.jpg" if "satellite" in prefix else f"{prefix}_rgb.jpg"
             rgb_path = os.path.join(folder_path, rgb_file)
-            
-            # 优化点 3: 使用 with 语句，确保文件句柄在使用后立刻释放，防止系统 Cache 溢出
-            with Image.open(rgb_path) as img:
-                rgb = img.convert('RGB')
-                
-                if "satellite" in prefix:
-                    sat_H, sat_W = rgb.size[1], rgb.size[0]
-                    sat_meter_per_pixel = SAT_RES / sat_H  
-                    sat_target_size = int(current_sat_meters / sat_meter_per_pixel)
 
-                    pixel_shift_x = int(shift_east / sat_meter_per_pixel)
-                    pixel_shift_y = int(shift_south / sat_meter_per_pixel)
-                    
-                    center_x = sat_W // 2 + pixel_shift_x
-                    center_y = sat_H // 2 + pixel_shift_y
+            if "satellite" in prefix:
+                is_sat = True
+                bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    with Image.open(rgb_path) as img:
+                        rgb_full = np.asarray(img.convert('RGB'), dtype=np.uint8)
+                    sat_H, sat_W = rgb_full.shape[0], rgb_full.shape[1]
+                else:
+                    sat_H, sat_W = bgr.shape[0], bgr.shape[1]
+                    rgb_full = None
 
-                    crop_left = int(center_x - sat_target_size // 2)
-                    crop_top = int(center_y - sat_target_size // 2)
+                sat_meter_per_pixel = SAT_RES / sat_H
+                sat_target_size = int(current_sat_meters / sat_meter_per_pixel)
 
-                    assert crop_left >= 0 and crop_top >= 0 and crop_left + sat_target_size <= sat_W and crop_top + sat_target_size <= sat_H, \
-                        f"Crop box out of bounds: left={crop_left}, top={crop_top}, target_size={sat_target_size}"
-                    
-                    # RGB 裁剪与缩放
-                    rgb = TF.crop(rgb, crop_top, crop_left, sat_target_size, sat_target_size)
-                    rgb = rgb.resize((1024, 1024), resample=Image.LANCZOS)                
+                pixel_shift_x = int(shift_east / sat_meter_per_pixel)
+                pixel_shift_y = int(shift_south / sat_meter_per_pixel)
 
-                    # 更新相机内外参
-                    K[0, 0] *= sat_W / sat_target_size  
-                    K[1, 1] *= sat_H / sat_target_size  
-                    c2w[0, 3] += shift_south
-                    c2w[2, 3] += shift_east
+                center_x = sat_W // 2 + pixel_shift_x
+                center_y = sat_H // 2 + pixel_shift_y
 
-                    # 优化点 4: 彻底摒弃 F.interpolate 产生巨大无用张量的逻辑
-                    # 采用先按比例推算小图坐标 -> 小图上直接裁剪 -> cv2 高速放大的策略
-                    depth_H, depth_W = depth.shape
-                    scale_x = depth_W / sat_W
-                    scale_y = depth_H / sat_H
+                crop_left = int(center_x - sat_target_size // 2)
+                crop_top = int(center_y - sat_target_size // 2)
 
-                    d_crop_left = int(crop_left * scale_x)
-                    d_crop_top = int(crop_top * scale_y)
-                    d_crop_w = int(sat_target_size * scale_x)
-                    d_crop_h = int(sat_target_size * scale_y)
+                assert crop_left >= 0 and crop_top >= 0 and crop_left + sat_target_size <= sat_W and crop_top + sat_target_size <= sat_H, \
+                    f"Crop box out of bounds: left={crop_left}, top={crop_top}, target_size={sat_target_size}"
 
-                    depth_crop = depth[d_crop_top : d_crop_top + d_crop_h, d_crop_left : d_crop_left + d_crop_w]
-                    
-                    # 使用 cv2 极速最近邻插值到 1024x1024
-                    depth = cv2.resize(depth_crop, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+                if bgr is not None:
+                    patch_bgr = bgr[crop_top : crop_top + sat_target_size, crop_left : crop_left + sat_target_size]
+                    patch_bgr = cv2.resize(patch_bgr, (1024, 1024), interpolation=cv2.INTER_LANCZOS4)
+                    rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
+                else:
+                    patch = rgb_full[crop_top : crop_top + sat_target_size, crop_left : crop_left + sat_target_size]
+                    rgb = cv2.resize(patch, (1024, 1024), interpolation=cv2.INTER_LANCZOS4)
 
-                # 将最终的 RGB 转回 numpy 数组
-                rgb = np.array(rgb)
+                K[0, 0] *= sat_W / sat_target_size
+                K[1, 1] *= sat_H / sat_target_size
+                c2w[0, 3] += shift_south
+                c2w[2, 3] += shift_east
+
+                depth_H, depth_W = depth.shape
+                scale_x = depth_W / sat_W
+                scale_y = depth_H / sat_H
+
+                d_crop_left = int(crop_left * scale_x)
+                d_crop_top = int(crop_top * scale_y)
+                d_crop_w = int(sat_target_size * scale_x)
+                d_crop_h = int(sat_target_size * scale_y)
+
+                depth_crop = depth[d_crop_top : d_crop_top + d_crop_h, d_crop_left : d_crop_left + d_crop_w]
+                depth = cv2.resize(depth_crop, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+            else:
+                is_sat = False
+                bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    with Image.open(rgb_path) as img:
+                        rgb = np.array(img.convert('RGB'))
+                else:
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
             # 数据增强与统一后处理
             rgb, depth, K = self._crop_resize_if_necessary(
-                rgb, depth, K, resolution, rng=rng, info=folder_path)
+                rgb, 
+                depth, 
+                K, 
+                resolution, 
+                rng=rng, 
+                info=folder_path, 
+                sat=is_sat,
+            )
 
             # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
             # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。
-            is_sat = "satellite" in prefix
             # if is_sat:
             #     tmp_sat_height = -c2w[1,3]
             #     depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
