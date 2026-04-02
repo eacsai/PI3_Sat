@@ -123,22 +123,23 @@ class PointLoss(nn.Module):
     def sat_uniform_spacing_loss(
         self,
         pts: torch.Tensor,
+        sat_ori_xy: Optional[torch.Tensor],
         valid: torch.Tensor,
         is_sat_view: Optional[torch.Tensor],
         eps: float = 1e-6,
     ) -> torch.Tensor:
-        """正射/卫星：相邻像素 local X、Y 步长应近似常数（未知 mpp 时只对齐一致性）。
+        """卫星：约束 local_points 的 XY 与网络预测的 sat_ori_xy 一致（L1）。
 
-        - 水平边：约束 ``pts[..., j+1, 0] - pts[..., j, 0]`` 在有效边上与均值的 L1（平均绝对偏差）小。
-        - 垂直边：约束 ``pts[..., i+1, 1] - pts[..., i, 1]`` 在有效边上与均值的 L1 小。
-        - **等距像元**：同一视角下，x 方向与 y 方向**平均步长（绝对值）**的差用 L1（近似方形 mpp）。
+        你已经在前向里输出了 `sat_ori_xy`（卫星图的原始 XY 预测），这里直接对齐：
+        对所有卫星视角、所有有效像素，最小化 ``|pts[..., :2] - sat_ori_xy|`` 的均值。
 
         Args:
             pts: (B, N, H, W, 3) 已与 GT 对齐尺度后的 local points。
+            sat_ori_xy: (B, N, H, W, 2) 与 pts 同尺度的卫星 XY 预测；None 时不加此项。
             valid: (B, N, H, W) bool。
             is_sat_view: (B, N) bool，某视角为卫星则为 True；None 时不加此项。
         """
-        if is_sat_view is None or self.sat_ortho_loss_weight <= 0:
+        if sat_ori_xy is None or is_sat_view is None or self.sat_ortho_loss_weight <= 0:
             return pts.new_zeros(())
         if not is_sat_view.any():
             return pts.new_zeros(())
@@ -147,55 +148,14 @@ class PointLoss(nn.Module):
         sat = is_sat_view.to(device=pts.device, dtype=torch.bool)
         if sat.dim() == 1:
             sat = sat.unsqueeze(0).expand(B, -1)
-        sat4 = sat[:, :, None, None]  # B,N,1,1
+        sat4 = sat[:, :, None, None]  # (B, N, 1, 1)
+        m = valid & sat4  # (B, N, H, W)
+        if not m.any():
+            return pts.new_zeros(())
 
-        # 水平：x 方向邻域差
-        dx = pts[..., :, 1:, 0] - pts[..., :, :-1, 0]
-        m_h = valid[..., :, :-1] & valid[..., :, 1:] & sat4
-        # 垂直：y 方向邻域差（local_points 的 y）
-        dy = pts[..., 1:, :, 1] - pts[..., :-1, :, 1]
-        m_v = valid[..., :-1, :] & valid[..., 1:, :] & sat4
-
-        mean_abs_dx = pts.new_zeros(B, N, device=pts.device, dtype=pts.dtype)
-        mean_abs_dy = pts.new_zeros(B, N, device=pts.device, dtype=pts.dtype)
-        has_h = m_h.any(dim=(-2, -1))
-        has_v = m_v.any(dim=(-2, -1))
-
-        loss_h = pts.new_zeros(())
-        if m_h.any():
-            adx = dx.abs()
-            num_h = (adx * m_h.float()).sum(dim=(-2, -1))
-            den_h = m_h.sum(dim=(-2, -1)).clamp_min(eps)
-            mean_abs_dx = num_h / den_h
-            mean_dx_for_var = (dx * m_h.float()).sum(dim=(-2, -1)) / m_h.sum(dim=(-2, -1)).clamp_min(eps)
-            loss_h = ((dx - mean_dx_for_var[:, :, None, None]).abs() * m_h.float()).sum() / m_h.sum().clamp_min(1.0)
-
-        loss_v = pts.new_zeros(())
-        if m_v.any():
-            ady = dy.abs() 
-            num_v = (ady * m_v.float()).sum(dim=(-2, -1))
-            den_v = m_v.sum(dim=(-2, -1)).clamp_min(eps)
-            mean_abs_dy = num_v / den_v
-            mean_dy_for_var = (dy * m_v.float()).sum(dim=(-2, -1)) / m_v.sum(dim=(-2, -1)).clamp_min(eps)
-            loss_v = ((dy - mean_dy_for_var[:, :, None, None]).abs() * m_v.float()).sum() / m_v.sum().clamp_min(1.0)
-
-        # x/y 平均步长（绝对值）一致：仅卫星视角且该视角 H、V 边均存在时计入
-        loss_xy_iso = pts.new_zeros(())
-        both = sat & has_h & has_v
-        if both.any():
-            diff = (mean_abs_dx - mean_abs_dy).abs()
-            loss_xy_iso = (diff * both.float()).sum() / both.float().sum().clamp_min(1.0)
-
-        if m_h.any() and m_v.any():
-            base = 0.5 * (loss_h + loss_v)
-        elif m_h.any():
-            base = loss_h
-        elif m_v.any():
-            base = loss_v
-        else:
-            base = pts.new_zeros(())
-
-        return base + loss_xy_iso
+        diff = (pts[..., :2] - sat_ori_xy).abs().sum(dim=-1)  # (B, N, H, W) L1 over x,y
+        loss = (diff * m.float()).sum() / m.sum().clamp_min(1.0)
+        return loss
 
     def forward(self, pred, gt, epoch: Optional[int] = None):
         pred_local_pts = pred['local_points']
@@ -220,6 +180,9 @@ class PointLoss(nn.Module):
             S_opt_local[S_opt_local <= 0] *= -1
 
         aligned_local_pts = S_opt_local.view(B, 1, 1, 1, 1) * pred_local_pts
+        aligned_sat_ori_xy = None
+        if pred.get('sat_ori_xy', None) is not None:
+            aligned_sat_ori_xy = S_opt_local.view(B, 1, 1, 1, 1) * pred['sat_ori_xy']
 
         # local point loss
         local_pts_loss = self.criteria_local(aligned_local_pts[valid_masks].float(), gt_local_pts[valid_masks].float()) * weights_[valid_masks].float()[..., None]
@@ -249,6 +212,7 @@ class PointLoss(nn.Module):
         if self.sat_ortho_loss_weight > 0:
             sat_grid = self.sat_uniform_spacing_loss(
                 aligned_local_pts,
+                aligned_sat_ori_xy,
                 valid_masks,
                 gt.get('is_sat_mask'),
             )

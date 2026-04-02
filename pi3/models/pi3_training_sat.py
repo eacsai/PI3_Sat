@@ -15,6 +15,9 @@ from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
 from .sat_position import FourierEmbedder
 
+MIN_MPP = 0.01
+MAX_MPP = 0.1
+
 def freeze_all_params(modules):
     for module in modules:
         try:
@@ -123,7 +126,7 @@ class Pi3(nn.Module):
             rope=self.rope,
         )
         self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
-
+        # self.sat_point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=2)
         # ----------------------
         #  Camera Pose Decoder
         # ----------------------
@@ -322,14 +325,72 @@ class Pi3(nn.Module):
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # local points
-            point_hidden = point_hidden.float()
-            # ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-            # xy, z = ret.split([2, 1], dim=-1)
-            # z = torch.exp(z)
-            # local_points = torch.cat([xy * z, z], dim=-1)
+            sat_xy = None
+            # local points PlanA
+            # point_hidden = point_hidden.float()
+            # # LinearPts3d 需要：只输入 patch tokens（去掉 register token），并传入 img_shape
+            # grd_points_all = self.point_head(
+            #     [point_hidden[:, self.patch_start_idx:]], (H, W)
+            # ).reshape(B, N, H, W, 3)
+            # sat_ret = self.sat_point_head(
+            #     [point_hidden[:, self.patch_start_idx:]], (H, W)
+            # ).reshape(B, N, H, W, 2)
 
+            # --- 卫星视图 (正交缩放先验) ---
+            # sat_log_mpp, sat_z = sat_ret.split([1, 1], dim=-1)  # (B, N, H, W, 1)
+            # # [核心逻辑 1] 保证同一张图 meter_per_pixel 唯一：对整幅图做全局平均
+            # global_log_mpp = sat_log_mpp.mean(dim=(2, 3), keepdim=True)  # (B, N, 1, 1, 1)
+            # sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_log_mpp)  # 确保缩放系数为正
+
+            # # [核心逻辑 2] 计算 XY：(U, V) - 0.5 是为了把相机原点定在图像正中心
+            # x_idx = torch.arange(W, device=sat_ret.device, dtype=sat_mpp.dtype)
+            # y_idx = torch.arange(H, device=sat_ret.device, dtype=sat_mpp.dtype)
+            # # 像素中心坐标：u,v in (0,1)，减 0.5 后以图像中心为原点
+            # u = (x_idx + 0.5) / W  # (W,)
+            # v = (y_idx + 0.5) / H  # (H,)
+            # grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')  # (H, W)
+            # sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
+
+            # wh = torch.tensor([W, H], device=sat_ret.device, dtype=sat_mpp.dtype)  # (2,)
+            # sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 单位：像素尺度
+            # sat_xy = sat_xy_base[None, None, :, :, :] * sat_mpp  # (B, N, H, W, 2)
+            # sat_points_all = torch.cat([sat_xy, sat_z], dim=-1)  # (B, N, H, W, 3)
+
+            # mask = is_sat_mask.to(sat_ret.device).view(B, N, 1, 1, 1)  # (B, N, 1, 1, 1) bool
+            # local_points = torch.where(mask, sat_points_all, grd_points_all)
+
+            # local points PlanB
+            point_hidden = point_hidden.float()
             local_points = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+
+            # local points PlanC
+            # point_hidden = point_hidden.float()
+            # grd_points_all = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+            # sat_xy, sat_z = grd_points_all.split([2, 1], dim=-1)
+            # # 用 sat_xy 的 dtype/device，避免依赖 sat_mpp/sat_ret 在此分支是否已定义
+            # x_idx = torch.arange(W, device=sat_xy.device, dtype=sat_xy.dtype)
+            # y_idx = torch.arange(H, device=sat_xy.device, dtype=sat_xy.dtype)
+            # # 像素中心坐标：u,v in (0,1)，减 0.5 后以图像中心为原点
+            # u = (x_idx + 0.5) / W  # (W,)
+            # v = (y_idx + 0.5) / H  # (H,)
+            # grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')  # (H, W)
+            # sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
+
+            # wh = torch.tensor([W, H], device=sat_xy.device, dtype=sat_xy.dtype)  # (2,)
+            # sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 单位：像素尺度
+
+            # # 估计单一标量 sat_mpp（x/y 共用）：最小二乘拟合 sat_xy ≈ sat_mpp * sat_xy_base
+            # # 避免 sat_xy_base≈0 时直接相除带来的 Inf/NaN 放大
+            # eps = 1e-6
+            # sat_xy_base_ = sat_xy_base[None, None, :, :, :]  # (1,1,H,W,2)
+            # num = (sat_xy * sat_xy_base_).sum(dim=(2, 3, 4), keepdim=True)  # (B,N,1,1,1)
+            # den = (sat_xy_base_ ** 2).sum(dim=(2, 3, 4), keepdim=True).clamp_min(eps)  # (1,1,1,1,1)
+            # sat_mpp = num / den  # (B,N,1,1,1)
+
+            # sat_xy_new = sat_xy_base_ * sat_mpp  # (B,N,H,W,2)
+            # sat_points_all = torch.cat([sat_xy_new, sat_z], dim=-1)
+            # mask = is_sat_mask.to(sat_xy.device).view(B, N, 1, 1, 1)  # (B, N, 1, 1, 1) bool
+            # local_points = torch.where(mask, sat_points_all, grd_points_all)
 
             # confidence
             if self.train_conf:
@@ -348,6 +409,7 @@ class Pi3(nn.Module):
         return dict(
             points=points,
             local_points=local_points,
+            sat_ori_xy=sat_xy if sat_xy is not None else None,
             conf=conf,
             camera_poses=camera_poses,
             global_points=None
