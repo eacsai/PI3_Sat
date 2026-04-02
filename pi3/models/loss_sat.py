@@ -1,0 +1,580 @@
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from typing import *
+import math
+import os
+
+from ..utils.geometry import homogenize_points, se3_inverse, depth_edge
+from ..utils.alignment import align_points_scale
+import torchvision.transforms.functional as TF
+
+from datasets import __HIGH_QUALITY_DATASETS__, __MIDDLE_QUALITY_DATASETS__
+to_pil_image = TF.to_pil_image
+
+# ---------------------------------------------------------------------------
+# Some functions from MoGe
+# ---------------------------------------------------------------------------
+
+def weighted_mean(x: torch.Tensor, w: torch.Tensor = None, dim: Union[int, torch.Size] = None, keepdim: bool = False, eps: float = 1e-7) -> torch.Tensor:
+    if w is None:
+        return x.mean(dim=dim, keepdim=keepdim)
+    else:
+        w = w.to(x.dtype)
+        return (x * w).mean(dim=dim, keepdim=keepdim) / w.mean(dim=dim, keepdim=keepdim).add(eps)
+
+def _smooth(err: torch.FloatTensor, beta: float = 0.0) -> torch.FloatTensor:
+    if beta == 0:
+        return err
+    else:
+        return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
+
+def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-12):
+    return torch.atan2(torch.cross(v1, v2, dim=-1).norm(dim=-1) + eps, (v1 * v2).sum(dim=-1))
+
+# ---------------------------------------------------------------------------
+# PointLoss: Scale-invariant Local Pointmap
+# ---------------------------------------------------------------------------
+
+class PointLoss(nn.Module):
+    def __init__(
+        self,
+        local_align_res=4096,
+        train_conf=False,
+        expected_dist_thresh=0.02,
+        normal_loss_start_epoch: int = 5,
+        sat_ortho_loss_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.local_align_res = local_align_res
+        self.criteria_local = nn.L1Loss(reduction='none')
+        self.normal_loss_start_epoch = int(normal_loss_start_epoch)
+        self.train_conf = train_conf
+        self.sat_ortho_loss_weight = float(sat_ortho_loss_weight)
+        if self.train_conf:
+            self.prepare_segformer()
+            self.conf_loss_fn = torch.nn.BCEWithLogitsLoss()
+            self.expected_dist_thresh = expected_dist_thresh
+
+    def prepare_segformer(self):
+        from pi3.models.segformer.model import EncoderDecoder
+        self.segformer = EncoderDecoder()
+        self.segformer.load_state_dict(torch.load('ckpts/segformer.b0.512x512.ade.160k.pth', map_location=torch.device('cpu'), weights_only=False)['state_dict'])
+        self.segformer = self.segformer.cuda()
+
+    def predict_sky_mask(self, imgs):
+        with torch.no_grad():
+            output = self.segformer.inference_(imgs)
+            output = output == 2
+        return output
+
+    def prepare_ROE(self, pts, mask, target_size=4096):
+        B, N, H, W, C = pts.shape
+        output = []
+        
+        for i in range(B):
+            valid_pts = pts[i][mask[i]]
+
+            if valid_pts.shape[0] > 0:
+                valid_pts = valid_pts.permute(1, 0).unsqueeze(0)  # (1, 3, N1)
+                # NOTE: Is is important to use nearest interpolate. Linear interpolate will lead to unstable result!
+                valid_pts = F.interpolate(valid_pts, size=target_size, mode='nearest')  # (1, 3, target_size)
+                valid_pts = valid_pts.squeeze(0).permute(1, 0)  # (target_size, 3)
+            else:
+                valid_pts = torch.ones((target_size, C), device=valid_pts.device)
+
+            output.append(valid_pts)
+
+        return torch.stack(output, dim=0)
+    
+    def noraml_loss(self, points, gt_points, mask):
+        not_edge = ~depth_edge(gt_points[..., 2], rtol=0.03)
+        mask = torch.logical_and(mask, not_edge)
+
+        leftup, rightup, leftdown, rightdown = points[..., :-1, :-1, :], points[..., :-1, 1:, :], points[..., 1:, :-1, :], points[..., 1:, 1:, :]
+        upxleft = torch.cross(rightup - rightdown, leftdown - rightdown, dim=-1)
+        leftxdown = torch.cross(leftup - rightup, rightdown - rightup, dim=-1)
+        downxright = torch.cross(leftdown - leftup, rightup - leftup, dim=-1)
+        rightxup = torch.cross(rightdown - leftdown, leftup - leftdown, dim=-1)
+
+        gt_leftup, gt_rightup, gt_leftdown, gt_rightdown = gt_points[..., :-1, :-1, :], gt_points[..., :-1, 1:, :], gt_points[..., 1:, :-1, :], gt_points[..., 1:, 1:, :]
+        gt_upxleft = torch.cross(gt_rightup - gt_rightdown, gt_leftdown - gt_rightdown, dim=-1)
+        gt_leftxdown = torch.cross(gt_leftup - gt_rightup, gt_rightdown - gt_rightup, dim=-1)
+        gt_downxright = torch.cross(gt_leftdown - gt_leftup, gt_rightup - gt_leftup, dim=-1)
+        gt_rightxup = torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown, dim=-1)
+
+        mask_leftup, mask_rightup, mask_leftdown, mask_rightdown = mask[..., :-1, :-1], mask[..., :-1, 1:], mask[..., 1:, :-1], mask[..., 1:, 1:]
+        mask_upxleft = mask_rightup & mask_leftdown & mask_rightdown
+        mask_leftxdown = mask_leftup & mask_rightdown & mask_rightup
+        mask_downxright = mask_leftdown & mask_rightup & mask_leftup
+        mask_rightxup = mask_rightdown & mask_leftup & mask_leftdown
+
+        MIN_ANGLE, MAX_ANGLE, BETA_RAD = math.radians(1), math.radians(90), math.radians(3)
+
+        loss = mask_upxleft * _smooth(angle_diff_vec3(upxleft, gt_upxleft).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD) \
+                + mask_leftxdown * _smooth(angle_diff_vec3(leftxdown, gt_leftxdown).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD) \
+                + mask_downxright * _smooth(angle_diff_vec3(downxright, gt_downxright).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD) \
+                + mask_rightxup * _smooth(angle_diff_vec3(rightxup, gt_rightxup).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
+
+        loss = loss.mean() / (4 * max(points.shape[-3:-1]))
+
+        return loss
+
+    def sat_uniform_spacing_loss(
+        self,
+        pts: torch.Tensor,
+        valid: torch.Tensor,
+        is_sat_view: Optional[torch.Tensor],
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """正射/卫星：相邻像素 local X、Y 步长应近似常数（未知 mpp 时只对齐一致性）。
+
+        - 水平边：约束 ``pts[..., j+1, 0] - pts[..., j, 0]`` 在有效边上与均值的 L1（平均绝对偏差）小。
+        - 垂直边：约束 ``pts[..., i+1, 1] - pts[..., i, 1]`` 在有效边上与均值的 L1 小。
+        - **等距像元**：同一视角下，x 方向与 y 方向**平均步长（绝对值）**的差用 L1（近似方形 mpp）。
+
+        Args:
+            pts: (B, N, H, W, 3) 已与 GT 对齐尺度后的 local points。
+            valid: (B, N, H, W) bool。
+            is_sat_view: (B, N) bool，某视角为卫星则为 True；None 时不加此项。
+        """
+        if is_sat_view is None or self.sat_ortho_loss_weight <= 0:
+            return pts.new_zeros(())
+        if not is_sat_view.any():
+            return pts.new_zeros(())
+
+        B, N, H, W, _ = pts.shape
+        sat = is_sat_view.to(device=pts.device, dtype=torch.bool)
+        if sat.dim() == 1:
+            sat = sat.unsqueeze(0).expand(B, -1)
+        sat4 = sat[:, :, None, None]  # B,N,1,1
+
+        # 水平：x 方向邻域差
+        dx = pts[..., :, 1:, 0] - pts[..., :, :-1, 0]
+        m_h = valid[..., :, :-1] & valid[..., :, 1:] & sat4
+        # 垂直：y 方向邻域差（local_points 的 y）
+        dy = pts[..., 1:, :, 1] - pts[..., :-1, :, 1]
+        m_v = valid[..., :-1, :] & valid[..., 1:, :] & sat4
+
+        mean_abs_dx = pts.new_zeros(B, N, device=pts.device, dtype=pts.dtype)
+        mean_abs_dy = pts.new_zeros(B, N, device=pts.device, dtype=pts.dtype)
+        has_h = m_h.any(dim=(-2, -1))
+        has_v = m_v.any(dim=(-2, -1))
+
+        loss_h = pts.new_zeros(())
+        if m_h.any():
+            adx = dx.abs()
+            num_h = (adx * m_h.float()).sum(dim=(-2, -1))
+            den_h = m_h.sum(dim=(-2, -1)).clamp_min(eps)
+            mean_abs_dx = num_h / den_h
+            mean_dx_for_var = (dx * m_h.float()).sum(dim=(-2, -1)) / m_h.sum(dim=(-2, -1)).clamp_min(eps)
+            loss_h = ((dx - mean_dx_for_var[:, :, None, None]).abs() * m_h.float()).sum() / m_h.sum().clamp_min(1.0)
+
+        loss_v = pts.new_zeros(())
+        if m_v.any():
+            ady = dy.abs() 
+            num_v = (ady * m_v.float()).sum(dim=(-2, -1))
+            den_v = m_v.sum(dim=(-2, -1)).clamp_min(eps)
+            mean_abs_dy = num_v / den_v
+            mean_dy_for_var = (dy * m_v.float()).sum(dim=(-2, -1)) / m_v.sum(dim=(-2, -1)).clamp_min(eps)
+            loss_v = ((dy - mean_dy_for_var[:, :, None, None]).abs() * m_v.float()).sum() / m_v.sum().clamp_min(1.0)
+
+        # x/y 平均步长（绝对值）一致：仅卫星视角且该视角 H、V 边均存在时计入
+        loss_xy_iso = pts.new_zeros(())
+        both = sat & has_h & has_v
+        if both.any():
+            diff = (mean_abs_dx - mean_abs_dy).abs()
+            loss_xy_iso = (diff * both.float()).sum() / both.float().sum().clamp_min(1.0)
+
+        if m_h.any() and m_v.any():
+            base = 0.5 * (loss_h + loss_v)
+        elif m_h.any():
+            base = loss_h
+        elif m_v.any():
+            base = loss_v
+        else:
+            base = pts.new_zeros(())
+
+        return base + loss_xy_iso
+
+    def forward(self, pred, gt, epoch: Optional[int] = None):
+        pred_local_pts = pred['local_points']
+        gt_local_pts = gt['local_points']
+        valid_masks = gt['valid_masks']
+        details = dict()
+        final_loss = 0.0
+
+        B, N, H, W, _ = pred_local_pts.shape
+
+        weights_ = gt_local_pts[..., 2]
+        weights_ = weights_.clamp_min(0.1 * weighted_mean(weights_, valid_masks, dim=(-2, -1), keepdim=True))
+        weights_ = 1 / (weights_ + 1e-6)
+
+        # alignment
+        with torch.no_grad():
+            xyz_pred_local = self.prepare_ROE(pred_local_pts.reshape(B, N, H, W, 3), valid_masks.reshape(B, N, H, W), target_size=self.local_align_res).contiguous()
+            xyz_gt_local = self.prepare_ROE(gt_local_pts.reshape(B, N, H, W, 3), valid_masks.reshape(B, N, H, W), target_size=self.local_align_res).contiguous()
+            xyz_weights_local = self.prepare_ROE((weights_[..., None]).reshape(B, N, H, W, 1), valid_masks.reshape(B, N, H, W), target_size=self.local_align_res).contiguous()[:, :, 0]
+
+            S_opt_local = align_points_scale(xyz_pred_local, xyz_gt_local, xyz_weights_local)
+            S_opt_local[S_opt_local <= 0] *= -1
+
+        aligned_local_pts = S_opt_local.view(B, 1, 1, 1, 1) * pred_local_pts
+
+        # local point loss
+        local_pts_loss = self.criteria_local(aligned_local_pts[valid_masks].float(), gt_local_pts[valid_masks].float()) * weights_[valid_masks].float()[..., None]
+
+        # conf loss
+        if self.train_conf:
+            pred_conf = pred['conf']
+
+            # probability loss
+            valid = local_pts_loss.detach().mean(-1, keepdims=True) < self.expected_dist_thresh
+            local_conf_loss = self.conf_loss_fn(pred_conf[valid_masks], valid.float())
+
+            sky_mask = self.predict_sky_mask(gt['imgs'].reshape(B*N, 3, H, W)).reshape(B, N, H, W)
+            sky_mask[valid_masks] = False
+            if sky_mask.sum() == 0:
+                sky_mask_loss = 0.0 * aligned_local_pts.mean()
+            else:
+                sky_mask_loss = self.conf_loss_fn(pred_conf[sky_mask], torch.zeros_like(pred_conf[sky_mask]))
+            
+            final_loss += 0.05 * (local_conf_loss + sky_mask_loss)
+            details['local_conf_loss'] = (local_conf_loss + sky_mask_loss)
+
+        final_loss += local_pts_loss.mean()
+        details['local_pts_loss'] = local_pts_loss.mean()
+
+        # 卫星：相邻像素 local x / y 步长一致性（常 mpp 先验）
+        if self.sat_ortho_loss_weight > 0:
+            sat_grid = self.sat_uniform_spacing_loss(
+                aligned_local_pts,
+                valid_masks,
+                gt.get('is_sat_mask'),
+            )
+            final_loss += self.sat_ortho_loss_weight * sat_grid
+            details['sat_ortho_grid_loss'] = sat_grid
+        else:
+            details['sat_ortho_grid_loss'] = aligned_local_pts.new_zeros(())
+
+        # normal loss2
+        if epoch is None or epoch >= self.normal_loss_start_epoch:
+            normal_loss = self.noraml_loss(aligned_local_pts, gt_local_pts, valid_masks)
+            final_loss += normal_loss.mean()
+            details['normal_loss'] = normal_loss.mean()
+        else:
+            details['normal_loss'] = aligned_local_pts.new_zeros(())
+
+        # [Optional] Global Point Loss
+        if 'global_points' in pred and pred['global_points'] is not None:
+            gt_pts = gt['global_points']
+
+            pred_global_pts = pred['global_points'] * S_opt_local.view(B, 1, 1, 1, 1)
+            global_pts_loss = self.criteria_local(pred_global_pts[valid_masks].float(), gt_pts[valid_masks].float()) * weights_[valid_masks].float()[..., None]
+
+            final_loss += global_pts_loss.mean()
+            details['global_pts_loss'] = global_pts_loss.mean()
+
+        return final_loss, details, S_opt_local
+
+# ---------------------------------------------------------------------------
+# CameraLoss: Affine-invariant Camera Pose
+# ---------------------------------------------------------------------------
+
+class CameraLoss(nn.Module):
+    def __init__(self, alpha=100):
+        super().__init__()
+        self.alpha = alpha
+
+    def rot_ang_loss(self, R, Rgt, eps=1e-6):
+        """
+        Args:
+            R: estimated rotation matrix [B, 3, 3]
+            Rgt: ground-truth rotation matrix [B, 3, 3]
+        Returns:  
+            R_err: rotation angular error 
+        """
+        residual = torch.matmul(R.transpose(1, 2), Rgt)
+        trace = torch.diagonal(residual, dim1=-2, dim2=-1).sum(-1)
+        cosine = (trace - 1) / 2
+        R_err = torch.acos(torch.clamp(cosine, -1.0 + eps, 1.0 - eps))  # handle numerical errors and NaNs
+        return R_err.mean()         # [0, 3.14]
+    
+    def forward(self, pred, gt, scale):
+        pred_pose = pred['camera_poses']
+        gt_pose = gt['camera_poses']
+
+        B, N, _, _ = pred_pose.shape
+
+        pred_pose_align = pred_pose.clone()
+        pred_pose_align[..., :3, 3] *=  scale.view(B, 1, 1)
+        
+        pred_w2c = se3_inverse(pred_pose_align)
+        gt_w2c = se3_inverse(gt_pose)
+        
+        pred_w2c_exp = pred_w2c.unsqueeze(2)
+        pred_pose_exp = pred_pose_align.unsqueeze(1)
+        
+        gt_w2c_exp = gt_w2c.unsqueeze(2)
+        gt_pose_exp = gt_pose.unsqueeze(1)
+        
+        pred_rel_all = torch.matmul(pred_w2c_exp, pred_pose_exp)
+        gt_rel_all = torch.matmul(gt_w2c_exp, gt_pose_exp)
+
+        mask = ~torch.eye(N, dtype=torch.bool, device=pred_pose.device)
+
+        t_pred = pred_rel_all[..., :3, 3][:, mask, ...]
+        R_pred = pred_rel_all[..., :3, :3][:, mask, ...]
+        
+        t_gt = gt_rel_all[..., :3, 3][:, mask, ...]
+        R_gt = gt_rel_all[..., :3, :3][:, mask, ...]
+
+        trans_loss = F.huber_loss(t_pred, t_gt, reduction='mean', delta=0.1)
+        
+        rot_loss = self.rot_ang_loss(
+            R_pred.reshape(-1, 3, 3), 
+            R_gt.reshape(-1, 3, 3)
+        )
+        
+        total_loss = self.alpha * trans_loss + rot_loss
+
+        return total_loss, dict(trans_loss=trans_loss, rot_loss=rot_loss)
+
+# ---------------------------------------------------------------------------
+# Final Loss
+# ---------------------------------------------------------------------------
+
+class Pi3Loss(nn.Module):
+    def __init__(
+        self,
+        train_conf=False,
+        save_vis=False,
+        save_vis_dir='data/vis_ply',
+        normal_loss_start_epoch: int = 5,
+        sat_ortho_loss_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.point_loss = PointLoss(
+            train_conf=train_conf,
+            normal_loss_start_epoch=normal_loss_start_epoch,
+            sat_ortho_loss_weight=sat_ortho_loss_weight,
+        )
+        self.camera_loss = CameraLoss()
+
+        self.save_vis = save_vis
+        self.save_vis_dir = save_vis_dir
+        self.vis_call_count = 0
+        if self.save_vis:
+            import os
+            os.makedirs(self.save_vis_dir, exist_ok=True)
+
+    def save_point_cloud_vis(self, points, masks, images, prefix='pred'):
+        """保存点云到 .ply 文件（保存第一个 batch 所有帧到一个文件）"""
+        from ..utils.basic import write_ply
+        import os
+
+        B, N, H, W, _ = points.shape
+
+        # 收集第一个 batch 所有帧的有效点
+        all_pts = []
+        all_rgb = []
+
+        for n in range(N):
+            mask = masks[0, n]
+            if mask.sum() == 0:
+                continue
+
+            pts = points[0, n][mask]
+            all_pts.append(pts)
+
+            # 提取颜色
+            if images is not None:
+                img = images[0, n].permute(1, 2, 0)[mask]
+                rgb = img.float() / 255.0 if img.max() > 1 else img.float()
+            else:
+                # 使用深度生成颜色
+                depth = points[0, n, ..., 2][mask]
+                depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+                rgb = torch.stack([depth_norm, 1 - depth_norm, torch.zeros_like(depth_norm)], dim=-1)
+            all_rgb.append(rgb)
+
+        if len(all_pts) == 0:
+            return
+
+        # 合并所有帧的点
+        merged_pts = torch.cat(all_pts, dim=0)
+        merged_rgb = torch.cat(all_rgb, dim=0)
+
+        filename = f"{prefix}_call.ply"
+        filepath = os.path.join(self.save_vis_dir, filename)
+        write_ply(merged_pts.cpu(), merged_rgb.cpu(), filepath)
+
+    def prepare_gt(self, gt):
+        gt_pts = torch.stack([view['pts3d'] for view in gt], dim=1)
+        masks = torch.stack([view['valid_mask'] for view in gt], dim=1)
+        poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
+
+        B, N, H, W, _ = gt_pts.shape
+        # transform to first frame camera coordinate
+        w2c_target = se3_inverse(poses[:, 0])
+        gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
+        poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
+
+        # normalize points
+        valid_batch = masks.sum([-1, -2, -3]) > 0
+        if valid_batch.sum() > 0:
+            B_ = valid_batch.sum()
+            all_pts = gt_pts[valid_batch].clone()
+            all_pts[~masks[valid_batch]] = 0
+            all_pts = all_pts.reshape(B_, N, -1, 3)
+            all_dis = all_pts.norm(dim=-1)
+            norm_factor = all_dis.sum(dim=[-1, -2]) / (masks[valid_batch].float().sum(dim=[-1, -2, -3]) + 1e-8)
+
+            gt_pts[valid_batch] = gt_pts[valid_batch] / norm_factor[..., None, None, None, None]
+            poses[valid_batch, ..., :3, 3] /= norm_factor[..., None, None]
+
+        extrinsics = se3_inverse(poses)
+        gt_local_pts = torch.einsum('bnij, bnhwj -> bnhwi', extrinsics, homogenize_points(gt_pts))[..., :3]
+        dataset_names = gt[0]['dataset']
+
+        is_sat_mask = None
+        if gt and 'is_satellite' in gt[0]:
+            flags = []
+            for view in gt:
+                s = view['is_satellite']
+                if isinstance(s, torch.Tensor):
+                    flags.append(s.to(device=gt_pts.device, dtype=torch.bool))
+                else:
+                    flags.append(
+                        torch.full((B,), bool(s), device=gt_pts.device, dtype=torch.bool)
+                    )
+            is_sat_mask = torch.stack(flags, dim=1)
+
+        # 可视化保存点云
+        if self.save_vis:
+            imgs = torch.stack([view['img'] for view in gt], dim=1)
+            self.save_point_cloud_vis(gt_pts, masks, imgs, prefix='gt_global')
+            test_img = to_pil_image(imgs[0, 1])
+            test_img.save('test_img.png')
+
+        out = dict(
+            imgs=torch.stack([view['img'] for view in gt], dim=1),
+            global_points=gt_pts,
+            local_points=gt_local_pts,
+            valid_masks=masks,
+            camera_poses=poses,
+            dataset_names=dataset_names,
+        )
+        if is_sat_mask is not None:
+            out['is_sat_mask'] = is_sat_mask
+        return out
+    
+    def normalize_pred(self, pred, gt):
+        local_points = pred['local_points']
+        camera_poses = pred['camera_poses']
+        B, N, H, W, _ = local_points.shape
+        masks = gt['valid_masks']
+
+        # normalize predict points
+        all_pts = local_points.clone()
+        all_pts[~masks] = 0
+        all_pts = all_pts.reshape(B, N, -1, 3)
+        all_dis = all_pts.norm(dim=-1)
+        norm_factor = all_dis.sum(dim=[-1, -2]) / (masks.float().sum(dim=[-1, -2, -3]) + 1e-8)
+        local_points  = local_points / norm_factor[..., None, None, None, None]
+
+        if 'global_points' in pred and pred['global_points'] is not None:
+            pred['global_points'] /= norm_factor[..., None, None, None, None]
+
+        camera_poses_normalized = camera_poses.clone()
+        camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
+
+        pred['local_points'] = local_points
+        pred['camera_poses'] = camera_poses_normalized
+
+        # 可视化保存点云（将 local_points 转换到世界坐标系）
+        if self.save_vis:
+            # local_points -> world_points: 使用 camera_poses_normalized 进行变换
+            pred_global_from_local = pred['points']
+            self.save_point_cloud_vis(pred_global_from_local, masks, gt['imgs'], prefix='pred_global')
+
+        return pred
+
+    def forward(self, pred, gt_raw, epoch: Optional[int] = None):
+        gt_normalized = self.prepare_gt(gt_raw)
+        pred_normalized = self.normalize_pred(pred, gt_normalized)
+
+        final_loss = 0.0
+        details = dict()
+
+        # 可视化深度分布直方图（区间占比，总和为1）
+        # for v in range(len(gt_raw)):
+        #     import matplotlib.pyplot as plt
+        #     import numpy as np
+
+        #     # 获取当前视角的深度和Mask
+        #     local_pts = gt_normalized['local_points'][:, v, :, :, 2]  # [B, H, W]
+        #     valid_mask = gt_normalized['valid_masks'][:, v, :, :]     # [B, H, W]
+            
+        #     # 计算总有效像素数（分母）
+        #     total_valid = valid_mask.sum() + 1e-8  # 防止除以0
+
+        #     # 定义区间：0.0-0.1, 0.1-0.2, ..., 0.9-1.0
+        #     ratios = []
+        #     labels = []
+            
+        #     for i in range(10):
+        #         lower = i / 10.0
+        #         upper = (i + 1) / 10.0
+                
+        #         # 核心修改：计算落在 [lower, upper) 区间内的点
+        #         # 注意：最后一个区间 0.9-1.0 我们通常设为闭区间 [0.9, 1.0] 以包含 1.0
+        #         if i == 9:
+        #             mask_in_range = (local_pts >= lower) & (local_pts <= upper) & valid_mask
+        #         else:
+        #             mask_in_range = (local_pts >= lower) & (local_pts < upper) & valid_mask
+                
+        #         ratio = mask_in_range.sum() / total_valid
+        #         ratios.append(ratio.item())
+        #         labels.append(f'{upper:.1f}') # X轴标签显示 0.1, 0.2...
+
+        #     # 创建保存目录
+        #     vis_dir = 'data/depth_distribution_vis'
+        #     os.makedirs(vis_dir, exist_ok=True)
+
+        #     # 绘制柱状图
+        #     plt.figure(figsize=(10, 6))
+            
+        #     # 绘制柱子，并在柱子上方显示具体数值
+        #     bars = plt.bar(labels, ratios, width=0.6, color='skyblue', edgecolor='black', alpha=0.7)
+            
+        #     # 在每个柱子上方添加数值标签
+        #     for bar in bars:
+        #         height = bar.get_height()
+        #         plt.text(bar.get_x() + bar.get_width()/2., height,
+        #                  f'{height:.2f}',
+        #                  ha='center', va='bottom', fontsize=10)
+
+        #     plt.xlabel('Depth Interval (Upper Bound)')
+        #     plt.ylabel('Ratio (Probability)')
+        #     plt.title(f'Depth Histogram for View {v} (Sum={sum(ratios):.2f})')
+        #     plt.grid(axis='y', alpha=0.3, linestyle='--')
+        #     plt.ylim(0, 1.05) # 稍微留一点空间给标签
+
+        #     save_path = os.path.join(vis_dir, f'view_{v}_depth_distribution.png')
+        #     plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        #     print(f"Saved visualization to {save_path}")
+        #     plt.close()
+
+        # Local Point Loss
+        point_loss, point_loss_details, scale = self.point_loss(pred_normalized, gt_normalized, epoch=epoch)
+        final_loss += point_loss
+        details.update(point_loss_details)
+
+        # Camera Loss
+        camera_loss, camera_loss_details = self.camera_loss(pred_normalized, gt_normalized, scale)
+        final_loss += camera_loss * 0.1
+        details.update(camera_loss_details)
+
+        return final_loss, details
+

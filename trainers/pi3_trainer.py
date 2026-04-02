@@ -95,6 +95,11 @@ class Pi3Trainer(BaseTrainer):
                 queries=queries.to(device=imgs.device, dtype=imgs.dtype),
                 is_sat_mask=is_sat_mask
             )
+        elif is_sat_mask is not None:
+            pred = self.model(
+                imgs,
+                is_sat_mask=is_sat_mask
+            )
         else:
             pred = self.model(imgs)
 

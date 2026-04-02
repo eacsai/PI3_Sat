@@ -1,7 +1,9 @@
+from typing import Any
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
-from copy import deepcopy
+from einops import rearrange
 
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points
@@ -10,11 +12,11 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextTransformerDecoder
 from .layers.camera_head import CameraHead
+from .layers.infinidepth_conv import ImplicitHead, BasicEncoder
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
+from .sat_position import FourierEmbedder
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
-from .sat_position import FourierEmbedder
-
 def freeze_all_params(modules):
     for module in modules:
         try:
@@ -29,12 +31,14 @@ class Pi3(nn.Module):
             self,
             pos_type='rope100',
             decoder_size='large',
-            load_vggt=False,
             load_pi3=True,
             freeze_encoder=True,
+            use_global_points=False,
             train_conf=False,
             num_dec_blk_not_to_checkpoint=4,
             ckpt=None,
+            default_query_count=112 * 112,
+            basic_encoder_dim: int = 128,
         ):
         super().__init__()
 
@@ -104,6 +108,21 @@ class Pi3(nn.Module):
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
 
+
+        # ----------------------
+        #     Query：patch token 序列 + (u,v) → 局部位姿系 3D 点（ImplicitHead 内双线性采样 + MLP）
+        # ----------------------
+        self.basic_encoder_dim = int(basic_encoder_dim)
+        self.basic_encoder = BasicEncoder(input_dim=3, output_dim=self.basic_encoder_dim, stride=4)
+        self.query_implicit_head = ImplicitHead(
+            hidden_dim=dec_embed_dim,
+            basic_dim=self.basic_encoder_dim,
+            fusion_type="gated",
+            out_dim=3,
+            hidden_list=[max(dec_embed_dim, 512), 256, 32],
+        )
+        self.default_query_count = int(default_query_count)
+
         # ----------------------
         #     Register_token
         # ----------------------
@@ -113,7 +132,7 @@ class Pi3(nn.Module):
         nn.init.normal_(self.register_token, std=1e-6)
 
         # ----------------------
-        #  Local Points Decoder
+        #  Local Points Decoder：先用 point_decoder 细化 token，再在 query 处采样
         # ----------------------
         self.point_decoder = TransformerDecoder(
             in_dim=2*self.dec_embed_dim, 
@@ -122,8 +141,6 @@ class Pi3(nn.Module):
             out_dim=1024,
             rope=self.rope,
         )
-        self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
-
         # ----------------------
         #  Camera Pose Decoder
         # ----------------------
@@ -137,6 +154,20 @@ class Pi3(nn.Module):
         )
         self.camera_head = CameraHead(dim=512)
 
+        # ----------------------
+        #  Global Points Decoder
+        # ----------------------
+        self.use_global_points = use_global_points
+        if use_global_points:
+            self.global_points_decoder = ContextTransformerDecoder(
+                in_dim=2*self.dec_embed_dim, 
+                dec_embed_dim=1024,
+                dec_num_heads=16,
+                out_dim=1024,
+                rope=self.rope,
+            )
+            self.global_point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
+
         # For ImageNet Normalize
         image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         image_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -145,23 +176,20 @@ class Pi3(nn.Module):
         self.register_buffer("image_std", image_std)
 
         self.train_conf = train_conf
-        # 仅在训练 confidence 时创建分支；若 load_pi3=true 且 train_conf=false 也建 conf，
-        # forward 从不调用它们 → DDP 报 unused parameters。
-        if train_conf:
-            assert ckpt is not None or load_pi3, "Please provide pi3 checkpoint to load confidence decoder."
-            self.conf_decoder = deepcopy(self.point_decoder)
-            self.conf_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=1)
-        else:
-            self.conf_decoder = None
-            self.conf_head = None
-
-        if train_conf:
+        if self.train_conf:
+            self.conf_head = nn.Sequential(
+                nn.Linear(self.dec_embed_dim, 512),
+                nn.GELU(),
+                nn.Linear(512, 1)
+            )
             freeze_all_params([
-                self.encoder, self.decoder,
-                self.point_decoder, self.point_head,
-                self.camera_decoder, self.camera_head,
-                self.register_token, self.sat_pos_embedder,
+                self.encoder, self.decoder, self.point_decoder,
+                self.query_implicit_head,
+                self.basic_encoder,
+                self.camera_decoder, self.camera_head, self.register_token
             ])
+        else:
+            self.conf_head = None
 
         if freeze_encoder:
             print('Freezing the encoder.')
@@ -200,7 +228,7 @@ class Pi3(nn.Module):
                 print("================================================")
                 print("[Pi3] Missing keys (in model but not in ckpt):", res.missing_keys)
 
-    def decode(self, hidden, N, H, W, is_sat_mask, sat_pos_embed=None):
+    def decode(self, hidden, N, H, W, is_sat_mask, sat_pos_embed=None,):
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -241,14 +269,10 @@ class Pi3(nn.Module):
             # 暂时变形为 (B, N, hw, dim)，根据 is_sat_mask 精准定位卫星视图
             hidden = hidden.reshape(B, N, hw, -1)
 
-            if is_sat_mask is not None:
-                # is_sat_mask: (B, N) bool → (B, N, 1, 1) float
-                sat_mask = is_sat_mask.to(hidden.device).unsqueeze(-1).unsqueeze(-1).float()
-                sat_pos = sat_pos_embed[:, None, :, :]  # (B, 1, hw, dim)
-                hidden = hidden + sat_mask * sat_pos
-            else:
-                # 兼容旧逻辑：没有 mask 时，默认第 0 个视图为卫星图
-                hidden[:, 0] = hidden[:, 0] + sat_pos_embed
+            # is_sat_mask: (B, N) bool → (B, N, 1, 1) float
+            sat_mask = is_sat_mask.to(hidden.device).unsqueeze(-1).unsqueeze(-1).float()
+            sat_pos = sat_pos_embed[:, None, :, :]  # (B, 1, hw, dim)
+            hidden = hidden + sat_mask * sat_pos
 
             # 重新展平为 (B*N, hw, dim)，准备进入 Decoder 循环
             hidden = hidden.reshape(B*N, hw, -1)
@@ -285,27 +309,31 @@ class Pi3(nn.Module):
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
     def forward(self, 
-                imgs,
-                is_sat_mask, # [B, N] bool
+                imgs, 
+                is_sat_mask, 
+                queries=None,
+                dense: bool = False, 
+                isTrain: bool = True
         ):  # [关键修改] 加入 queries 和 is_sat_mask 参数
-
+        imgs_01 = imgs
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
+
         patch_h, patch_w = H // 14, W // 14
         
         # encode by dinov2
-        imgs = imgs.reshape(B*N, _, H, W)
-        hidden = self.encoder(imgs, is_training=True)
+        frames = imgs.reshape(B*N, _, H, W)
+        dinov2_hidden = self.encoder(frames, is_training=True)
 
-        if isinstance(hidden, dict):
-            hidden = hidden["x_norm_patchtokens"]
+        if isinstance(dinov2_hidden, dict):
+            dinov2_hidden = dinov2_hidden["x_norm_patchtokens"]
 
         # ==========================================================
         # 1. 只生成卫星位置编码，不在这里直接与 hidden 叠加
         # ==========================================================
-        y_steps = torch.linspace(-1, 1, patch_h, device=hidden.device, dtype=hidden.dtype)
-        x_steps = torch.linspace(-1, 1, patch_w, device=hidden.device, dtype=hidden.dtype)
+        y_steps = (torch.arange(patch_h, device=dinov2_hidden.device, dtype=dinov2_hidden.dtype) + 0.5) / patch_h * 2.0 - 1.0
+        x_steps = (torch.arange(patch_w, device=dinov2_hidden.device, dtype=dinov2_hidden.dtype) + 0.5) / patch_w * 2.0 - 1.0
         grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
         
         pos_input = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
@@ -314,41 +342,88 @@ class Pi3(nn.Module):
         # 保存下来供 decode 循环使用
         sat_pos_embed = sat_pos_embed.reshape(B, patch_h * patch_w, -1)
         # 将 sat_pos_embed 传给 decode，并用 is_sat_mask 控制哪些视图叠加卫星位置编码
-        hidden, pos = self.decode(hidden, N, H, W, is_sat_mask, sat_pos_embed)
+        hidden, pos = self.decode(dinov2_hidden, N, H, W, sat_pos_embed=sat_pos_embed, is_sat_mask=is_sat_mask)
 
-        point_hidden = self.point_decoder(hidden, xpos=pos)
-        if self.train_conf:
-            conf_hidden = self.conf_decoder(hidden, xpos=pos)
+        # ==========================================================
+        # 2. 生成/处理 Queries (u, v)
+        # - 若外部提供 queries（来自 dataset），则直接使用
+        # - 否则保留原有稀疏/稠密采样逻辑
+        # ==========================================================
+        if queries is not None and dense is False:
+            queries = queries.reshape(B * N, -1, 2)
+            query_per_view = queries.shape[1]
+        else:
+            # 使用像素中心约定 (pixel-center convention)，与 dataset 采样一致：
+            #   u = (pixel_x + 0.5) / W,  v = (pixel_y + 0.5) / H
+            x_steps = (torch.arange(W, device=hidden.device, dtype=hidden.dtype) + 0.5) / W
+            y_steps = (torch.arange(H, device=hidden.device, dtype=hidden.dtype) + 0.5) / H
+            grid_y, grid_x = torch.meshgrid(y_steps, x_steps, indexing='ij')
+            dense_queries = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)  # (H*W, 2)
+
+            if dense:
+                query_per_view = dense_queries.shape[0]
+                queries = dense_queries.unsqueeze(0).expand(B * N, -1, -1).contiguous() # (B*N, H*W, 2)
+            else:
+                query_per_view = min(self.default_query_count, dense_queries.shape[0])
+                rand_matrix = torch.rand(B * N, dense_queries.shape[0], device=hidden.device)
+                idx = rand_matrix.argsort(dim=1)[:, :query_per_view]
+                queries = dense_queries[idx] # (B*N, query_per_view, 2)
+
+        # ==========================================================
+        # 3. point_decoder(hidden) patch token + queries：ImplicitHead 在 query 处 grid_sample，MLP → (x,y,z)
+        # ==========================================================
+        point_tokens = self.point_decoder(hidden, xpos=pos)
+        point_feat = point_tokens[:, self.patch_start_idx:]
+
+        grid = (queries * 2.0 - 1.0).clamp(-1.0 + 1e-6, 1.0 - 1e-6).unsqueeze(1)
+
+        def sample_feat(feat_map):
+            sampled = F.grid_sample(feat_map, grid, mode='bilinear', align_corners=False)
+            return sampled.squeeze(2).transpose(1, 2)
+
+        point_map_e = point_feat.transpose(1, 2).reshape(B * N, self.dec_embed_dim, patch_h, patch_w)
+        q_for_conf = sample_feat(point_map_e) if self.train_conf else None
+
+        x_basic = imgs_01.reshape(B * N, _, H, W)
+        basic_feat_map = self.basic_encoder(x_basic)  # (B*N, basic_dim, H/4, W/4)
+
+        local_points = self.query_implicit_head(point_feat, basic_feat_map, patch_h, patch_w, queries)
+        local_points = local_points.reshape(B, N, query_per_view, 3)
+        
+        # 3.6. 处理相机hidden
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # local points
-            point_hidden = point_hidden.float()
-            # ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-            # xy, z = ret.split([2, 1], dim=-1)
-            # z = torch.exp(z)
-            # local_points = torch.cat([xy * z, z], dim=-1)
+            local_points = local_points.float()
 
-            local_points = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-
-            # confidence
             if self.train_conf:
-                conf_hidden = conf_hidden.float()
-                conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                conf = self.conf_head(q_for_conf.float()).reshape(B, N, query_per_view, -1)
             else:
                 conf = None
                 
             # camera
             camera_hidden = camera_hidden.float()
             camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
-            
-            # unproject local points using camera poses
-            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
 
-        return dict(
-            points=points,
-            local_points=local_points,
-            conf=conf,
+            # unproject local points using camera poses
+            points = torch.einsum('bnij, bnqj -> bnqi', camera_poses, homogenize_points(local_points))[..., :3]
+
+        if dense and query_per_view == H * W and isTrain is False:
+            points_out = points.reshape(B, N, H, W, 3)
+            local_points_out = local_points.reshape(B, N, H, W, 3)
+            query_uv_out = queries.reshape(B, N, H, W, 2)
+            conf_out = conf.reshape(B, N, H, W, -1) if conf is not None else None
+        else:
+            points_out = points
+            local_points_out = local_points
+            query_uv_out = queries.reshape(B, N, query_per_view, 2)
+            conf_out = conf
+
+        return dict[str, Any | None](
+            points=points_out,
+            local_points=local_points_out,
+            query_uv=query_uv_out,
+            conf=conf_out,
             camera_poses=camera_poses,
             global_points=None
         )

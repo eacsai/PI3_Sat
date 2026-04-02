@@ -44,13 +44,27 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
     
     if mode == 'train':
         target_suffixes = ('0001_pair', '0004_pair', '0005_pair', '0007_pair', '0008_pair', '0012_pair', '0016_pair', '0017_pair', '0022_pair', '0023_pair', '0025_pair', '0027_pair', '0032_pair', '0035_pair', '0036_pair', '0056_pair', '0057_pair')
+        # exclude_suffixes = (
+        #     '0013_pair', '0516_pair', '0515_pair', '0512_pair', '0508_pair', 
+        #     ' 0507_pair', '0506_pair', '0505_pair', '0503_pair', '0502_pair', 
+        #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
+        #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
+        # )
+        exclude_suffixes = ('0013_pair', '0516_pair')
     else:
         target_suffixes = ('0013_pair',)
 
     for l1_name in level1_names:
+        # if mode == 'train':
+        #     if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
+        #         continue
+        # else:
+        #     if not l1_name.endswith(target_suffixes):
+        #         continue
+
         if not l1_name.endswith(target_suffixes):
             continue
-            
+
         l1_path = os.path.join(root_dir, l1_name)
         level2_names = sorted([d for d in os.listdir(l1_path) if os.path.isdir(os.path.join(l1_path, d))])
         
@@ -78,75 +92,6 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
     return final_paths
 
 
-def _sample_query_uv(depth, rng, Q=8192, edge_ratio=0.3, flat_ratio=0.25):
-    """从深度图中采样 Q 个 query：边缘（高梯度）/ 平坦（低梯度）/ 随机，只在有效区域采样。
-
-    卫星图可提高 flat_ratio、降低 edge_ratio，减轻立面/房顶对噪声深度的过拟合。
-    返回 (Q, 2) 的 float32 数组，值域 [0, 1]。
-    """
-    H, W = depth.shape
-    min_depth = np.min(depth)
-    # TODO: 这里valid_indices是否合理
-    valid_indices = np.flatnonzero(depth > max(min_depth, 0.0))
-    n_valid = valid_indices.size
-    if n_valid < Q:
-        raise ValueError(f"Not enough valid pixels ({n_valid} < {Q})")
-
-    edge_ratio = float(np.clip(edge_ratio, 0.0, 1.0))
-    flat_ratio = float(np.clip(flat_ratio, 0.0, 1.0))
-    k_edge = min(int(round(Q * edge_ratio)), n_valid)
-    k_flat = min(int(round(Q * flat_ratio)), n_valid - k_edge)
-    k_rand = Q - k_edge - k_flat
-    if k_rand < 0:
-        k_rand = 0
-        k_flat = min(k_flat, max(0, Q - k_edge))
-
-    gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
-    grad_at_valid = np.hypot(gx.ravel()[valid_indices], gy.ravel()[valid_indices])
-
-    sampled_parts = []
-    used = np.zeros(n_valid, dtype=bool)
-
-    if k_edge > 0:
-        edge_local = np.argpartition(-grad_at_valid, min(k_edge, n_valid) - 1)[:k_edge]
-        sampled_parts.append(edge_local)
-        used[edge_local] = True
-
-    remain = np.flatnonzero(~used)
-    if k_flat > 0 and remain.size > 0:
-        kf = min(k_flat, remain.size)
-        grad_r = grad_at_valid[remain]
-        flat_sub = np.argpartition(grad_r, kf - 1)[:kf]
-        flat_local = remain[flat_sub]
-        sampled_parts.append(flat_local)
-        used[flat_local] = True
-
-    remain2 = np.flatnonzero(~used)
-    need = Q - sum(len(p) for p in sampled_parts)
-    need = min(need, remain2.size)
-    if need > 0:
-        rand_local = remain2[rng.choice(remain2.size, size=need, replace=False)]
-        sampled_parts.append(rand_local)
-
-    sampled_local = np.concatenate(sampled_parts) if sampled_parts else np.zeros(0, dtype=np.int64)
-    if sampled_local.size < Q:
-        pick_mask = np.ones(n_valid, dtype=bool)
-        if sampled_local.size > 0:
-            pick_mask[sampled_local] = False
-        pool = np.flatnonzero(pick_mask)
-        if pool.size > 0:
-            extra = min(Q - sampled_local.size, pool.size)
-            add = pool[rng.choice(pool.size, size=extra, replace=False)]
-            sampled_local = np.concatenate([sampled_local, add])
-    if sampled_local.size > Q:
-        sampled_local = sampled_local[:Q]
-
-    sampled = valid_indices[sampled_local]
-    ys, xs = np.divmod(sampled, W)
-    return np.stack([(xs + 0.5) / W, (ys + 0.5) / H], axis=-1).astype(np.float32)
-
-
 class GoogleStreetDataset(BaseDataset):
     def __init__(
         self,
@@ -154,11 +99,6 @@ class GoogleStreetDataset(BaseDataset):
         verbose=False,
         split=False,
         shift_range=20,
-        query_sample_count: int = 8192,
-        query_edge_ratio: float = 0.3,
-        query_flat_ratio: float = 0.25,
-        satellite_query_edge_ratio: float = 0.15,
-        satellite_query_flat_ratio: float = 0.55,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -172,11 +112,6 @@ class GoogleStreetDataset(BaseDataset):
         self.shift_range = shift_range 
         self.sat_height = 5726
         self.sat_gap = 60
-        self.query_sample_count = int(query_sample_count)
-        self.query_edge_ratio = float(query_edge_ratio)
-        self.query_flat_ratio = float(query_flat_ratio)
-        self.satellite_query_edge_ratio = float(satellite_query_edge_ratio)
-        self.satellite_query_flat_ratio = float(satellite_query_flat_ratio)
 
     def __len__(self):
         return len(self.file_paths)
@@ -198,7 +133,7 @@ class GoogleStreetDataset(BaseDataset):
         # Collect all candidate views in this folder, then sample an arbitrary
         # satellite/ground/uav combination.
         sat_files = [f for f in npy_configs if 'satellite' in f]
-        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f)]
+        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f and 'pano' not in f)]
         uav_files = [f for f in npy_configs if 'uav' in f]
 
         total_available = len(sat_files) + len(ground_files) + len(uav_files)
@@ -260,10 +195,12 @@ class GoogleStreetDataset(BaseDataset):
                     depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
                 else:
                     depth = temp_depth_tensor.detach().numpy().astype(np.float32)
-                    depth[depth > 60] = -1
+                # depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
+                depth[depth > 60] = -1
             else:
                 depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
-
+                if 'uav' in prefix:
+                    depth[depth > 300] = -1
             # C. 安全加载并裁剪 RGB 图像
             rgb_file = f"{prefix}.jpg" if "satellite" in prefix else f"{prefix}_rgb.jpg"
             rgb_path = os.path.join(folder_path, rgb_file)
@@ -273,6 +210,7 @@ class GoogleStreetDataset(BaseDataset):
                 rgb = img.convert('RGB')
                 
                 if "satellite" in prefix:
+                    is_sat = True
                     sat_H, sat_W = rgb.size[1], rgb.size[0]
                     sat_meter_per_pixel = SAT_RES / sat_H  
                     sat_target_size = int(current_sat_meters / sat_meter_per_pixel)
@@ -315,32 +253,32 @@ class GoogleStreetDataset(BaseDataset):
                     # 使用 cv2 极速最近邻插值到 1024x1024
                     depth = cv2.resize(depth_crop, (1024, 1024), interpolation=cv2.INTER_NEAREST)
 
+                else:
+                    is_sat = False
+
                 # 将最终的 RGB 转回 numpy 数组
                 rgb = np.array(rgb)
 
             # 数据增强与统一后处理
             rgb, depth, K = self._crop_resize_if_necessary(
-                rgb, depth, K, resolution, rng=rng, info=folder_path)
+                rgb, 
+                depth, 
+                K, 
+                resolution, 
+                rng=rng, 
+                info=folder_path, 
+                sat=is_sat,
+            )
 
             # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
             # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。
-            is_sat = "satellite" in prefix
             # if is_sat:
             #     tmp_sat_height = -c2w[1,3]
             #     depth = np.clip(depth, a_min = tmp_sat_height - self.sat_gap, a_max = None)
 
-            er = self.satellite_query_edge_ratio if is_sat else self.query_edge_ratio
-            fr = self.satellite_query_flat_ratio if is_sat else self.query_flat_ratio
             view_dict = dict(
                 img=rgb,
                 depthmap=depth.astype(np.float32),
-                query_uv=_sample_query_uv(
-                    depth.astype(np.float32),
-                    rng,
-                    Q=self.query_sample_count,
-                    edge_ratio=er,
-                    flat_ratio=fr,
-                ),
                 camera_pose=c2w.astype(np.float32),
                 camera_intrinsics=K.astype(np.float32),
                 sat_gap=self.sat_gap,

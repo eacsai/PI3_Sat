@@ -1,7 +1,7 @@
 # @package _global_
 
 model:
-    _target_: pi3.models.pi3_training_query.Pi3
+    _target_: pi3.models.pi3_training_sat.Pi3
     pos_type: rope100
     decoder_size: large
     load_pi3: true
@@ -12,14 +12,16 @@ model:
 
 loss:
     train_loss: 
-        _target_: pi3.models.loss_query.Pi3Loss
+        _target_: pi3.models.loss_sat.Pi3Loss
         train_conf: false
         normal_loss_start_epoch: 5   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
+        sat_ortho_loss_weight: 0.0
 
     test_loss:
-        _target_: pi3.models.loss_query.Pi3Loss
+        _target_: pi3.models.loss_sat.Pi3Loss
         train_conf: false
         normal_loss_start_epoch: 0   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
+        sat_ortho_loss_weight: 0.0
 
 train:
     # TODO: DEBUG CHANGE

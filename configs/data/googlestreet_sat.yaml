@@ -1,10 +1,10 @@
 # @package _global_
 
 train_dataset:
-    length: 39000         # 8000 Original and 39000 All
+    length: 8000         # 8000 Original and 39000 All
 
     weights: 
-        GoogleStreet: 39000  # 8000 Original and 39000 All
+        GoogleStreet: 8000  # 8000 Original and 39000 All
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
@@ -15,7 +15,7 @@ train_dataset:
         frame_num: 3
         aug_crop: 16
         use_query: false
-        use_sat: false
+        use_sat: true
         transform:
             _partial_: true
             _target_: datasets.base.transforms.JitterJpegLossBlurring
@@ -40,6 +40,7 @@ test_dataset:
         z_far: 30000
         frame_num: 3
         use_query: false
+        use_sat: true
         resolution:
             - [252, 252]
         transform:

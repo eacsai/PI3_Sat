@@ -33,6 +33,7 @@ class BaseDataset(EasyDataset):
         shuffle=True,
         use_sparse_depth=False,
         use_query=True,
+        use_sat=True,
         query_sample_count=8192,
         patch_size=0,
     ):
@@ -73,6 +74,7 @@ class BaseDataset(EasyDataset):
         self.random_sample_thres = random_sample_thres  # default not to do that
 
         self.use_query = use_query
+        self.use_sat = use_sat
         self.query_sample_count = query_sample_count
         self.patch_size = patch_size
     def set_epoch(self, epoch, base_seed=None):
@@ -302,7 +304,7 @@ class BaseDataset(EasyDataset):
                             )
                             view['n_patches'] = 0
                             view['patch_size'] = 0
-                    else:
+                    if not self.use_sat:
                         view['is_satellite'] = None
                 # # Visualize the point cloud
                 # all_pts = []
