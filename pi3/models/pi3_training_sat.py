@@ -15,8 +15,8 @@ from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
 from .sat_position import FourierEmbedder
 
-MIN_MPP = 0.01
-MAX_MPP = 0.1
+MIN_MPP = 0.005
+MAX_MPP = 0.05
 
 def freeze_all_params(modules):
     for module in modules:
@@ -125,8 +125,15 @@ class Pi3(nn.Module):
             out_dim=1024,
             rope=self.rope,
         )
+        self.sat_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=16,
+            out_dim=1024,
+            rope=self.rope,
+        )
         self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
-        # self.sat_point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=2)
+        self.sat_point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=2)
         # ----------------------
         #  Camera Pose Decoder
         # ----------------------
@@ -194,6 +201,26 @@ class Pi3(nn.Module):
                     print(f"[Pi3] Expanding register_token from {reg_token.shape} to {self.register_token.shape}")
                     # 在第1维复制一份：view0 和 view1 初始权重相同
                     pi3_weight['register_token'] = reg_token.repeat(1, 2, 1, 1)
+
+            # =======================================================
+            # 2. 把 point_decoder 的权重复制一份给 sat_decoder（与 Pi3 safetensors 扁平 key 对齐）
+            #    checkpoint 里是 point_decoder.xxx，不是名为 "point_decoder" 的单独一项
+            # =======================================================
+            _pd_prefix = "point_decoder."
+            _sd_prefix = "sat_decoder."
+            _sat_keys = {k for k in pi3_weight if k.startswith(_sd_prefix)}
+            if _sat_keys:
+                # 已有 sat_decoder.* 权重则不再覆盖
+                pass
+            else:
+                _copied = 0
+                for k, v in list(pi3_weight.items()):
+                    if k.startswith(_pd_prefix):
+                        nk = _sd_prefix + k[len(_pd_prefix) :]
+                        pi3_weight[nk] = v.clone()
+                        _copied += 1
+                if _copied > 0:
+                    print(f"[Pi3] Copied {_copied} tensors from {_pd_prefix}* to {_sd_prefix}* for sat_decoder init.")
 
             res = self.load_state_dict(pi3_weight, strict=False)
             print("Loading pi3 weights", res)
@@ -319,7 +346,9 @@ class Pi3(nn.Module):
         # 将 sat_pos_embed 传给 decode，并用 is_sat_mask 控制哪些视图叠加卫星位置编码
         hidden, pos = self.decode(hidden, N, H, W, is_sat_mask, sat_pos_embed)
 
+        # 地面/无人机：主干特征走 point_decoder；卫星：独立 sat_decoder（再经 sat_point_head 得 mpp/z）
         point_hidden = self.point_decoder(hidden, xpos=pos)
+        sat_hidden = self.sat_decoder(hidden, xpos=pos)
         if self.train_conf:
             conf_hidden = self.conf_decoder(hidden, xpos=pos)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
@@ -327,41 +356,43 @@ class Pi3(nn.Module):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             sat_xy = None
             # local points PlanA
-            # point_hidden = point_hidden.float()
-            # # LinearPts3d 需要：只输入 patch tokens（去掉 register token），并传入 img_shape
-            # grd_points_all = self.point_head(
-            #     [point_hidden[:, self.patch_start_idx:]], (H, W)
-            # ).reshape(B, N, H, W, 3)
-            # sat_ret = self.sat_point_head(
-            #     [point_hidden[:, self.patch_start_idx:]], (H, W)
-            # ).reshape(B, N, H, W, 2)
+            point_hidden = point_hidden.float()
+            sat_hidden = sat_hidden.float()
+            # LinearPts3d 需要：只输入 patch tokens（去掉 register token），并传入 img_shape
+            ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+            xy, z = ret.split([2, 1], dim=-1)
+            grd_points_all = torch.cat([xy * z, z], dim=-1)
+
+            sat_ret = self.sat_point_head(
+                [sat_hidden[:, self.patch_start_idx:]], (H, W)
+            ).reshape(B, N, H, W, 2)
 
             # --- 卫星视图 (正交缩放先验) ---
-            # sat_log_mpp, sat_z = sat_ret.split([1, 1], dim=-1)  # (B, N, H, W, 1)
-            # # [核心逻辑 1] 保证同一张图 meter_per_pixel 唯一：对整幅图做全局平均
-            # global_log_mpp = sat_log_mpp.mean(dim=(2, 3), keepdim=True)  # (B, N, 1, 1, 1)
-            # sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_log_mpp)  # 确保缩放系数为正
+            sat_log_mpp, sat_z = sat_ret.split([1, 1], dim=-1)  # (B, N, H, W, 1)
+            # [核心逻辑 1] 保证同一张图 meter_per_pixel 唯一：对整幅图做全局平均
+            global_log_mpp = sat_log_mpp.mean(dim=(2, 3), keepdim=True)  # (B, N, 1, 1, 1)
+            sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_log_mpp)  # 确保缩放系数为正
 
-            # # [核心逻辑 2] 计算 XY：(U, V) - 0.5 是为了把相机原点定在图像正中心
-            # x_idx = torch.arange(W, device=sat_ret.device, dtype=sat_mpp.dtype)
-            # y_idx = torch.arange(H, device=sat_ret.device, dtype=sat_mpp.dtype)
-            # # 像素中心坐标：u,v in (0,1)，减 0.5 后以图像中心为原点
-            # u = (x_idx + 0.5) / W  # (W,)
-            # v = (y_idx + 0.5) / H  # (H,)
-            # grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')  # (H, W)
-            # sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
+            # [核心逻辑 2] 计算 XY：(U, V) - 0.5 是为了把相机原点定在图像正中心
+            x_idx = torch.arange(W, device=sat_ret.device, dtype=sat_mpp.dtype)
+            y_idx = torch.arange(H, device=sat_ret.device, dtype=sat_mpp.dtype)
+            # 像素中心坐标：u,v in (0,1)，减 0.5 后以图像中心为原点
+            u = (x_idx + 0.5) / W  # (W,)
+            v = (y_idx + 0.5) / H  # (H,)
+            grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')  # (H, W)
+            sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
 
-            # wh = torch.tensor([W, H], device=sat_ret.device, dtype=sat_mpp.dtype)  # (2,)
-            # sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 单位：像素尺度
-            # sat_xy = sat_xy_base[None, None, :, :, :] * sat_mpp  # (B, N, H, W, 2)
-            # sat_points_all = torch.cat([sat_xy, sat_z], dim=-1)  # (B, N, H, W, 3)
+            wh = torch.tensor([W, H], device=sat_ret.device, dtype=sat_mpp.dtype)  # (2,)
+            sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 单位：像素尺度
+            sat_xy_final = sat_xy_base[None, None, :, :, :] * sat_mpp  # (B, N, H, W, 2)
+            sat_points_all = torch.cat([sat_xy_final, sat_z], dim=-1)  # (B, N, H, W, 3)
 
-            # mask = is_sat_mask.to(sat_ret.device).view(B, N, 1, 1, 1)  # (B, N, 1, 1, 1) bool
-            # local_points = torch.where(mask, sat_points_all, grd_points_all)
+            mask = is_sat_mask.to(sat_ret.device).view(B, N, 1, 1, 1)  # (B, N, 1, 1, 1) bool
+            local_points = torch.where(mask, sat_points_all, grd_points_all)
 
             # local points PlanB
-            point_hidden = point_hidden.float()
-            local_points = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+            # point_hidden = point_hidden.float()
+            # local_points = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
 
             # local points PlanC
             # point_hidden = point_hidden.float()
