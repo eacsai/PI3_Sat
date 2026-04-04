@@ -28,7 +28,7 @@ train:
     num_workers: 4 # debug use 0
     batch_size: 1              # not use, dynamic batch size
     num_epoch: 50
-    iters_per_epoch: 220 # 220 Original and 1110 All
+    iters_per_epoch: 170 # 70 Original and 340 All
 
     print_freq: 10
     base_seed: 666

@@ -50,20 +50,20 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
         #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
         #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
         # )
-        exclude_suffixes = ('0013_pair', '0516_pair')
+        exclude_suffixes = ('0013_pair')
     else:
         target_suffixes = ('0013_pair',)
 
     for l1_name in level1_names:
-        # if mode == 'train':
-        #     if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
-        #         continue
-        # else:
-        #     if not l1_name.endswith(target_suffixes):
-        #         continue
+        if mode == 'train':
+            if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
+                continue
+        else:
+            if not l1_name.endswith(target_suffixes):
+                continue
 
-        if not l1_name.endswith(target_suffixes):
-            continue
+        # if not l1_name.endswith(target_suffixes):
+        #     continue
 
         l1_path = os.path.join(root_dir, l1_name)
         level2_names = sorted([d for d in os.listdir(l1_path) if os.path.isdir(os.path.join(l1_path, d))])
@@ -120,7 +120,8 @@ class GoogleStreetDataset(BaseDataset):
         return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', string)]
 
     def _get_views(self, index, resolution, rng):
-        n_views_target = 3
+        # 随机选择返回 2 张或 3 张图
+        n_views_target = self.frame_num
         if index >= len(self.file_paths):
             raise IndexError(f"Index {index} out of range. Dataset has {len(self.file_paths)} samples.")
         folder_path = str(self.file_paths[index])

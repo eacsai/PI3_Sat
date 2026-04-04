@@ -40,6 +40,7 @@ test_dataset:
         z_far: 30000
         frame_num: 3
         use_query: false
+        use_sat: false
         resolution:
             - [252, 252]
         transform:

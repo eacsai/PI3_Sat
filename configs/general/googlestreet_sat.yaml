@@ -18,7 +18,7 @@ log:
   ckpt_interval: 10 # interval of epoch
   max_checkpoints: 3
   # ckpt_dir: '${work_dir}/outputs/${name}-${now:%Y-%m-%d_%H-%M-%S}/ckpts'
-  ckpt_dir: '${work_dir}/outputs/${name}'
+  ckpt_dir: '${work_dir}/outputs/${name}/ckpts'
 
 hydra:
   run:

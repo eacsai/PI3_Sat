@@ -354,7 +354,6 @@ class Pi3(nn.Module):
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            sat_xy = None
             # local points PlanA
             point_hidden = point_hidden.float()
             sat_hidden = sat_hidden.float()
@@ -439,9 +438,10 @@ class Pi3(nn.Module):
 
         return dict(
             points=points,
+            sat_ori_xy=None,  # 原始预测的sat_xy
             local_points=local_points,
-            sat_ori_xy=sat_xy if sat_xy is not None else None,
             conf=conf,
             camera_poses=camera_poses,
-            global_points=None
+            global_points=None,
+            sat_mpp=sat_mpp
         )
