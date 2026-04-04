@@ -4,7 +4,7 @@ defaults:
   - model: pi3_googlestreet_sat.yaml
   - train: train_pi3_lowres_megadepth
   - data: googlestreet_sat.yaml
-  - general: googlestreet.yaml
+  - general: googlestreet_sat.yaml
   - extras: default.yaml
   - override hydra/job_logging: custom
   - override hydra/hydra_logging: colorlog

@@ -169,6 +169,11 @@ class PointLoss(nn.Module):
         weights_ = gt_local_pts[..., 2]
         weights_ = weights_.clamp_min(0.1 * weighted_mean(weights_, valid_masks, dim=(-2, -1), keepdim=True))
         weights_ = 1 / (weights_ + 1e-6)
+        
+        # 对每个视角的 weight 进行独立归一化，使其有效像素的平均权重为 1
+        # 这样即使卫星图深度很大（原始 weights_ 极小），归一化后也能和无人机/地面图有同等量级的 loss 贡献
+        view_mean_weight = weighted_mean(weights_, valid_masks, dim=(-2, -1), keepdim=True)
+        weights_ = weights_ / (view_mean_weight + 1e-6)
 
         # alignment
         with torch.no_grad():
