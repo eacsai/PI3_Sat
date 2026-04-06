@@ -46,13 +46,13 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
         target_suffixes = ('0001_pair', '0004_pair', '0005_pair', '0007_pair', '0008_pair', '0012_pair', '0016_pair', '0017_pair', '0022_pair', '0023_pair', '0025_pair', '0027_pair', '0032_pair', '0035_pair', '0036_pair', '0056_pair', '0057_pair')
         # exclude_suffixes = (
         #     '0013_pair', '0516_pair', '0515_pair', '0512_pair', '0508_pair', 
-        #     ' 0507_pair', '0506_pair', '050                                                       5_pair', '0503_pair', '0502_pair', 
+        #     ' 0507_pair', '0506_pair', '0505_pair', '0503_pair', '0502_pair', 
         #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
         #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
         # )
-        exclude_suffixes = ('0013_pair', '0516_pair')
+        exclude_suffixes = ('0013_pair')
     else:
-        target_suffixes = ('0516_pair',)
+        target_suffixes = ('0013_pair',)
 
     for l1_name in level1_names:
         # if mode == 'train':

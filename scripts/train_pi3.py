@@ -13,3 +13,5 @@ def main(hydra_cfg):
 
 if __name__ == '__main__':
     main()
+
+# accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 7 --num_machines 1 scripts/train_pi3.py
