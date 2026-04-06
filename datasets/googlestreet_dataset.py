@@ -46,7 +46,7 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
         target_suffixes = ('0001_pair', '0004_pair', '0005_pair', '0007_pair', '0008_pair', '0012_pair', '0016_pair', '0017_pair', '0022_pair', '0023_pair', '0025_pair', '0027_pair', '0032_pair', '0035_pair', '0036_pair', '0056_pair', '0057_pair')
         # exclude_suffixes = (
         #     '0013_pair', '0516_pair', '0515_pair', '0512_pair', '0508_pair', 
-        #     ' 0507_pair', '0506_pair', '050                                                       5_pair', '0503_pair', '0502_pair', 
+        #     ' 0507_pair', '0506_pair', '0505_pair', '0503_pair', '0502_pair', 
         #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
         #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
         # )
@@ -111,7 +111,7 @@ class GoogleStreetDataset(BaseDataset):
         self.file_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
         self.shift_range = shift_range 
         self.sat_height = 5726
-        self.sat_gap = 60
+        self.sat_gap = 150
 
     def __len__(self):
         return len(self.file_paths)
@@ -146,6 +146,14 @@ class GoogleStreetDataset(BaseDataset):
         sat_files_sorted = sorted(sat_files, key=self.natural_key)
         ground_files_sorted = sorted(ground_files, key=self.natural_key)
         uav_files_sorted = sorted(uav_files, key=self.natural_key)
+
+        # 明确数据集中一定有地面图，直接以第一张地面图的高度为水平面地平线的世界坐标系
+        ref_npy_name = ground_files_sorted[0]
+        ref_meta = np.load(os.path.join(folder_path, ref_npy_name), allow_pickle=True).item()
+        ref_c2w_height = ref_meta['c2w'][1, 3]
+        ref_c2w = np.eye(4, dtype=np.float32)
+        ref_c2w[1, 3] = ref_c2w_height
+        ref_w2c = np.linalg.inv(ref_c2w)
 
         if n_views == total_available:
             sat_sel, ground_sel, uav_sel = sat_files_sorted, ground_files_sorted, uav_files_sorted
@@ -182,6 +190,9 @@ class GoogleStreetDataset(BaseDataset):
             # A. 加载内参(K)和外参(c2w)
             meta = np.load(os.path.join(folder_path, npy_name), allow_pickle=True).item()
             K, c2w = meta['intrinsics'].copy(), meta['c2w'].copy()
+            
+            # 以参考相机(第一张地面图)为世界坐标系，计算相对的外参
+            c2w = ref_w2c @ c2w
 
             # B. 极速加载深度图
             if 'ground' in prefix and 'satellite' not in prefix:  

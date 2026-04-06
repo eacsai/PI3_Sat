@@ -261,12 +261,8 @@ class BaseDataset(EasyDataset):
                     view['z_far'] = self.z_far
                     if 'satellite' in view['label']:
                         view['camera_pose_ori'] = view['camera_pose'] # cam2world
-                        camera_pose_new = view['camera_pose'].copy()
-                        if len(gd_list) > 0:
-                            min_pose_y = min(item['camera_pose'][1, 3] for item in gd_list)
-                        else:
-                            min_pose_y = float(-view['sat_gap']) # if no ground drone view, just use the sat_gap as the y value for satellite view
-                        camera_pose_new[1,3] = min_pose_y - view['sat_gap']
+                        camera_pose_new = view['camera_pose'].copy()# if no ground drone view, just use the sat_gap as the y value for satellite view
+                        camera_pose_new[1,3] = -view['sat_gap']
                         view['camera_pose_new'] = se3_inverse(camera_pose_new) # world2cam
                         pts3d, valid_mask = satellite_depthmap_to_absolute_camera_coordinates(**view)
                         view['camera_pose'] = camera_pose_new # cam2world
