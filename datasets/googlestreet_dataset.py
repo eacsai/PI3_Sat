@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import random
 from pathlib import Path
 import re
+import io
 import cv2  # 新增：用于在 CPU 上极速处理深度图插值
 
 SAT_RES = 500 # 卫星图分辨率(米)
@@ -50,20 +51,20 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
         #     '0501_pair', '0496_pair', ' 0493_pair', '0472_pair', '0455_pair',
         #     '0446_pair', '0411_pair', ' 0407_pair', '0377_pair', '0360_pair',
         # )
-        exclude_suffixes = ('0013_pair', '0516_pair')
+        exclude_suffixes = ('0516_pair')
     else:
         target_suffixes = ('0516_pair',)
 
     for l1_name in level1_names:
-        # if mode == 'train':
-        #     if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
-        #         continue
-        # else:
-        #     if not l1_name.endswith(target_suffixes):
-        #         continue
+        if mode == 'train':
+            if not l1_name.endswith('_pair') or l1_name in exclude_suffixes:
+                continue
+        else:
+            if not l1_name.endswith(target_suffixes):
+                continue
 
-        if not l1_name.endswith(target_suffixes):
-            continue
+        # if not l1_name.endswith(target_suffixes):
+        #     continue
 
         l1_path = os.path.join(root_dir, l1_name)
         level2_names = sorted([d for d in os.listdir(l1_path) if os.path.isdir(os.path.join(l1_path, d))])
@@ -108,10 +109,37 @@ class GoogleStreetDataset(BaseDataset):
         self.verbose = verbose
         self.dataset_label = 'googlestreet'
         mode = self.mode
+        self.data_root = data_root
+        self.lmdb_path = '/data/wangqw/dataset_lmdb'
+        self.use_lmdb = os.path.exists(self.lmdb_path)
+        
+        if self.verbose:
+            print(f"[{self.dataset_label}] initialized with LMDB caching set to {self.use_lmdb}")
+
         self.file_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
         self.shift_range = shift_range 
         self.sat_height = 5726
         self.sat_gap = 150
+
+    def _init_lmdb_env(self):
+        if not hasattr(self, 'lmdb_env'):
+            import lmdb
+            self.lmdb_env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
+            with self.lmdb_env.begin(buffers=True) as txn:
+                dir_cache_bytes = txn.get(b'__DIR_CACHE__')
+                if dir_cache_bytes:
+                    self.dir_cache = json.loads(dir_cache_bytes.tobytes().decode('utf-8'))
+                else:
+                    self.dir_cache = {}
+
+    def get_file_content(self, txn, path):
+        if txn is None:
+            return path
+        encoded_path = path.encode('utf-8')
+        raw_bytes = txn.get(encoded_path)
+        if raw_bytes is None:
+            return path # Fallback 如果不在LMDB里
+        return io.BytesIO(raw_bytes.tobytes())
 
     def __len__(self):
         return len(self.file_paths)
@@ -125,7 +153,18 @@ class GoogleStreetDataset(BaseDataset):
         if index >= len(self.file_paths):
             raise IndexError(f"Index {index} out of range. Dataset has {len(self.file_paths)} samples.")
         folder_path = str(self.file_paths[index])
-        npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
+        
+        if getattr(self, 'use_lmdb', False):
+            self._init_lmdb_env()
+            txn = self.lmdb_env.begin(buffers=True)
+            npy_configs = self.dir_cache.get(folder_path, [])
+            if len(npy_configs) == 0:
+                # 兼容旧的文件系统中存在新目录，但是缓存还没更新的情况
+                try: npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
+                except: pass
+        else:
+            txn = None
+            npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
 
         shift_east = rng.uniform(-1, 1) * self.shift_range
         shift_south = rng.uniform(-1, 1) * self.shift_range
@@ -149,7 +188,7 @@ class GoogleStreetDataset(BaseDataset):
 
         # 明确数据集中一定有地面图，直接以第一张地面图的高度为水平面地平线的世界坐标系
         ref_npy_name = ground_files_sorted[0]
-        ref_meta = np.load(os.path.join(folder_path, ref_npy_name), allow_pickle=True).item()
+        ref_meta = np.load(self.get_file_content(txn, os.path.join(folder_path, ref_npy_name)), allow_pickle=True).item()
         ref_c2w_height = ref_meta['c2w'][1, 3]
         ref_c2w = np.eye(4, dtype=np.float32)
         ref_c2w[1, 3] = ref_c2w_height
@@ -188,7 +227,7 @@ class GoogleStreetDataset(BaseDataset):
             prefix = npy_name.replace('_rgb.npy', '')
 
             # A. 加载内参(K)和外参(c2w)
-            meta = np.load(os.path.join(folder_path, npy_name), allow_pickle=True).item()
+            meta = np.load(self.get_file_content(txn, os.path.join(folder_path, npy_name)), allow_pickle=True).item()
             K, c2w = meta['intrinsics'].copy(), meta['c2w'].copy()
             
             # 以参考相机(第一张地面图)为世界坐标系，计算相对的外参
@@ -198,19 +237,19 @@ class GoogleStreetDataset(BaseDataset):
             if 'ground' in prefix and 'satellite' not in prefix:  
                 # 优化点 1: weights_only=True 加速安全反序列化
                 temp_depth_tensor = torch.load(
-                    os.path.join(folder_path, f"{prefix}_depth_dap.pt"), 
+                    self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth_dap.pt")), 
                     map_location='cpu', 
                     weights_only=True
                 )
                 # 优化点 2: 用 .any() 极速判断张量是否非空
                 if not temp_depth_tensor.any():
-                    depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
+                    depth = np.load(self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth.npy"))).astype(np.float32)
                 else:
                     depth = temp_depth_tensor.detach().numpy().astype(np.float32)
                 # depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
                 depth[depth > 60] = -1
             else:
-                depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
+                depth = np.load(self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth.npy"))).astype(np.float32)
                 if 'uav' in prefix:
                     depth[depth > 300] = -1
             # C. 安全加载并裁剪 RGB 图像
@@ -218,7 +257,7 @@ class GoogleStreetDataset(BaseDataset):
             rgb_path = os.path.join(folder_path, rgb_file)
             
             # 优化点 3: 使用 with 语句，确保文件句柄在使用后立刻释放，防止系统 Cache 溢出
-            with Image.open(rgb_path) as img:
+            with Image.open(self.get_file_content(txn, rgb_path)) as img:
                 rgb = img.convert('RGB')
                 
                 if "satellite" in prefix:

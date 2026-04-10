@@ -6,7 +6,7 @@ sys.path.append('.')
 import hydra
 import trainers
 
-@hydra.main(version_base="1.2", config_path="../configs", config_name="googlestreet_sat")
+@hydra.main(version_base="1.2", config_path="../configs", config_name="googlestreet_ori")
 def main(hydra_cfg):
     trainer = eval(hydra_cfg.trainer)(hydra_cfg)
     trainer.train()

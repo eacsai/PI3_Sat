@@ -28,7 +28,7 @@ train:
     num_workers: 4 # debug use 0
     batch_size: 1              # not use, dynamic batch size
     num_epoch: 50
-    iters_per_epoch: 70 # 70 Original and 170 All
+    iters_per_epoch: 170 # 70 Original and 170 All
 
     print_freq: 10
     base_seed: 666
@@ -62,7 +62,7 @@ train:
     # Optimizer config
     optimizer:
         type: AdamW
-        lr: 5e-5
+        lr: 1e-4  # Original 5e-5, All 1e-4
         weight_decay: 5e-2
         betas: [0.9, 0.95]
         verbose: true
