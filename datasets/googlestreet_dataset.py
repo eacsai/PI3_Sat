@@ -117,7 +117,9 @@ class GoogleStreetDataset(BaseDataset):
             print(f"[{self.dataset_label}] initialized with LMDB caching set to {self.use_lmdb}")
 
         self.file_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
-        self.shift_range = shift_range 
+        # 只使用 60% 的数据
+        self.file_paths = self.file_paths[:int(len(self.file_paths) * 0.6)]
+        self.shift_range = shift_range
         self.sat_height = 5726
         self.sat_gap = 150
 

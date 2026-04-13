@@ -1,10 +1,10 @@
 # @package _global_
 
 train_dataset:
-    length: 39000         # 8000 Original and 39000 All
+    length: 23400         # 8000 Original and 39000 All and 23400 60%
 
     weights: 
-        GoogleStreet: 39000  # 8000 Original and 39000 All
+        GoogleStreet: 23400  # 8000 Original and 39000 All
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset

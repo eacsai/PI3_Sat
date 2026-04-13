@@ -25,10 +25,10 @@ loss:
 
 train:
     # TODO: DEBUG CHANGE
-    num_workers: 4 # debug use 0
+    num_workers: 2 # debug use 0
     batch_size: 1              # not use, dynamic batch size
     num_epoch: 50
-    iters_per_epoch: 170 # 70 Original and 170 All
+    iters_per_epoch: 100 # 70 Original and 170 All and 110 60%
 
     print_freq: 10
     base_seed: 666
@@ -62,7 +62,7 @@ train:
     # Optimizer config
     optimizer:
         type: AdamW
-        lr: 1e-4  # Original 5e-5, All 1e-4
+        lr: 5e-5  # Original 5e-5, All 1e-4
         weight_decay: 5e-2
         betas: [0.9, 0.95]
         verbose: true
@@ -81,7 +81,7 @@ train:
 
 test:
     # TODO: DEBUG CHANGE
-    num_workers: 4              # 16
+    num_workers: 2              # 16
     batch_size: 1              # not use, dynamic batch size
     print_freq: 10
     iters_per_test: -1
