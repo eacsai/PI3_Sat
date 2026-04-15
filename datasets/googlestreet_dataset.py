@@ -3,19 +3,12 @@ sys.path.append('.')
 
 from datasets.base.base_dataset import BaseDataset
 import os
+import pickle
 import numpy as np
-import os.path as osp
 from PIL import Image
-import torchvision.transforms.functional as TF
 from datasets.base.transforms import *
 import json
-from tqdm import tqdm
-import torch
-import torch.nn.functional as F
-import random
-from pathlib import Path
 import re
-import io
 import cv2  # 新增：用于在 CPU 上极速处理深度图插值
 
 SAT_RES = 500 # 卫星图分辨率(米)
@@ -94,6 +87,17 @@ def get_sorted_pair_paths(root_dir='.', split=True, mode='train'):
 
 
 class GoogleStreetDataset(BaseDataset):
+    # Shared LMDB environments keyed by (pid, path). py-lmdb refuses to open the
+    # same path twice in a single process (e.g. when both train_dataset and
+    # test_dataset point at the same LMDB), so we cache Environment handles. The
+    # PID in the key makes the cache fork-safe: worker processes spawned by the
+    # dataloader see an empty cache for their own pid and open a fresh handle.
+    _env_pool: dict = {}
+    # Cached dir_cache per path so the LMDB only has to be opened once per
+    # process for metadata even when multiple Dataset instances (train + test)
+    # are built before the dataloader fork.
+    _dir_cache_pool: dict = {}
+
     def __init__(
         self,
         data_root='/data/zhongyao/dataset',
@@ -110,38 +114,101 @@ class GoogleStreetDataset(BaseDataset):
         self.dataset_label = 'googlestreet'
         mode = self.mode
         self.data_root = data_root
-        self.lmdb_path = '/data/wangqw/dataset_lmdb'
-        self.use_lmdb = os.path.exists(self.lmdb_path)
-        
-        if self.verbose:
-            print(f"[{self.dataset_label}] initialized with LMDB caching set to {self.use_lmdb}")
+        # v2 LMDB layout: one pickle blob per view, pre-resized RGB/depth and
+        # pre-scaled K. Produced by scripts/pack_googlestreet_lmdb.py.
+        # Use the SSD copy under /home (nvme) instead of the HDD copy under /data.
+        self.lmdb_path = '/home/wangqw/NeurIPS26/dataset_lmdb_v2'
+        if not os.path.exists(self.lmdb_path):
+            raise FileNotFoundError(
+                f"[{self.dataset_label}] LMDB not found at {self.lmdb_path}. "
+                "Run scripts/pack_googlestreet_lmdb.py first."
+            )
 
-        self.file_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
+        if self.verbose:
+            print(f"[{self.dataset_label}] using LMDB at {self.lmdb_path}")
+
+        # Load dir_cache eagerly so we can filter file_paths to only the folders
+        # that actually made it into the LMDB. We cache per-path so that train
+        # and test dataset instances constructed back-to-back don't both open
+        # the LMDB (py-lmdb forbids re-opening the same env in one process
+        # until the previous handle is fully GC'd, which is timing-dependent).
+        cached = GoogleStreetDataset._dir_cache_pool.get(self.lmdb_path)
+        if cached is None:
+            cached = self._load_dir_cache_from_disk()
+            GoogleStreetDataset._dir_cache_pool[self.lmdb_path] = cached
+        self.dir_cache = cached
+
+        all_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
         # 只使用 60% 的数据
-        self.file_paths = self.file_paths[:int(len(self.file_paths) * 0.6)]
+        # all_paths = all_paths[:int(len(all_paths) * 0.6)]
+        self.file_paths = [p for p in all_paths if p in self.dir_cache]
+        if self.verbose:
+            print(
+                f"[{self.dataset_label}] {len(self.file_paths)}/{len(all_paths)} folders available in LMDB"
+            )
+
         self.shift_range = shift_range
         self.sat_height = 5726
         self.sat_gap = 150
 
-    def _init_lmdb_env(self):
-        if not hasattr(self, 'lmdb_env'):
-            import lmdb
-            self.lmdb_env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
-            with self.lmdb_env.begin(buffers=True) as txn:
+    def _load_dir_cache_from_disk(self) -> dict:
+        """Open the LMDB briefly, read __VERSION__ + __DIR_CACHE__, close it."""
+        import lmdb
+        env = lmdb.open(
+            self.lmdb_path,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        )
+        try:
+            with env.begin(buffers=True) as txn:
+                version_bytes = txn.get(b'__VERSION__')
+                if version_bytes is None:
+                    raise RuntimeError(
+                        f"[{self.dataset_label}] LMDB at {self.lmdb_path} is missing __VERSION__. "
+                        "Repack with scripts/pack_googlestreet_lmdb.py."
+                    )
+                version = int(bytes(version_bytes).decode('utf-8'))
+                if version != 2:
+                    raise RuntimeError(
+                        f"[{self.dataset_label}] unsupported LMDB version {version}; expected 2."
+                    )
                 dir_cache_bytes = txn.get(b'__DIR_CACHE__')
-                if dir_cache_bytes:
-                    self.dir_cache = json.loads(dir_cache_bytes.tobytes().decode('utf-8'))
-                else:
-                    self.dir_cache = {}
+                if dir_cache_bytes is None:
+                    return {}
+                return json.loads(bytes(dir_cache_bytes).decode('utf-8'))
+        finally:
+            env.close()
 
-    def get_file_content(self, txn, path):
-        if txn is None:
-            return path
-        encoded_path = path.encode('utf-8')
-        raw_bytes = txn.get(encoded_path)
-        if raw_bytes is None:
-            return path # Fallback 如果不在LMDB里
-        return io.BytesIO(raw_bytes.tobytes())
+    def _get_env(self):
+        """Return the LMDB Environment for the current process, opening it on
+        first use. Re-entrant across multiple dataset instances in the same
+        process (they share the same handle)."""
+        pid = os.getpid()
+        key = (pid, self.lmdb_path)
+        env = GoogleStreetDataset._env_pool.get(key)
+        if env is None:
+            import lmdb
+            env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+            )
+            GoogleStreetDataset._env_pool[key] = env
+        return env
+
+    def _load_view_blob(self, txn, folder_path: str, prefix: str):
+        """Load one view's pickle blob. Returns a dict with keys K, c2w, rgb, depth, s."""
+        key = f"{folder_path}|{prefix}".encode('utf-8')
+        raw = txn.get(key)
+        if raw is None:
+            raise KeyError(f"[{self.dataset_label}] Missing LMDB view: {folder_path}|{prefix}")
+        # pickle.loads accepts any bytes-like, including the memoryview LMDB hands
+        # back when buffers=True, so we skip the extra bytes() memcpy.
+        return pickle.loads(raw)
 
     def __len__(self):
         return len(self.file_paths)
@@ -155,32 +222,27 @@ class GoogleStreetDataset(BaseDataset):
         if index >= len(self.file_paths):
             raise IndexError(f"Index {index} out of range. Dataset has {len(self.file_paths)} samples.")
         folder_path = str(self.file_paths[index])
-        
-        if getattr(self, 'use_lmdb', False):
-            self._init_lmdb_env()
-            txn = self.lmdb_env.begin(buffers=True)
-            npy_configs = self.dir_cache.get(folder_path, [])
-            if len(npy_configs) == 0:
-                # 兼容旧的文件系统中存在新目录，但是缓存还没更新的情况
-                try: npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
-                except: pass
-        else:
-            txn = None
-            npy_configs = [f for f in os.listdir(folder_path) if f.endswith('_rgb.npy')]
+
+        env = self._get_env()
+        txn = env.begin(buffers=True)
+        folder_info = self.dir_cache.get(folder_path)
+        if folder_info is None:
+            raise KeyError(f"[{self.dataset_label}] {folder_path} not in LMDB dir_cache")
+        all_prefixes = folder_info['p']
+        ref_c2w_height = float(folder_info['ry'])
 
         shift_east = rng.uniform(-1, 1) * self.shift_range
         shift_south = rng.uniform(-1, 1) * self.shift_range
         current_sat_meters = rng.uniform(70, 210)
 
-        # Collect all candidate views in this folder, then sample an arbitrary
-        # satellite/ground/uav combination.
-        sat_files = [f for f in npy_configs if 'satellite' in f]
-        ground_files = [f for f in npy_configs if ('ground' in f and 'satellite' not in f and 'pano' not in f)]
-        uav_files = [f for f in npy_configs if 'uav' in f]
+        # Partition prefixes by view type.
+        sat_files = [p for p in all_prefixes if 'satellite' in p]
+        ground_files = [p for p in all_prefixes if ('ground' in p and 'satellite' not in p and 'pano' not in p)]
+        uav_files = [p for p in all_prefixes if 'uav' in p]
 
         total_available = len(sat_files) + len(ground_files) + len(uav_files)
         if total_available <= 0:
-            raise ValueError(f"[{self.dataset_label}] No valid *_rgb.npy views found under {folder_path}")
+            raise ValueError(f"[{self.dataset_label}] No valid views found under {folder_path}")
 
         n_views = min(n_views_target, total_available)
 
@@ -188,10 +250,7 @@ class GoogleStreetDataset(BaseDataset):
         ground_files_sorted = sorted(ground_files, key=self.natural_key)
         uav_files_sorted = sorted(uav_files, key=self.natural_key)
 
-        # 明确数据集中一定有地面图，直接以第一张地面图的高度为水平面地平线的世界坐标系
-        ref_npy_name = ground_files_sorted[0]
-        ref_meta = np.load(self.get_file_content(txn, os.path.join(folder_path, ref_npy_name)), allow_pickle=True).item()
-        ref_c2w_height = ref_meta['c2w'][1, 3]
+        # 使用 packer 预先记录的参考地面相机高度构造世界坐标系。
         ref_c2w = np.eye(4, dtype=np.float32)
         ref_c2w[1, 3] = ref_c2w_height
         ref_w2c = np.linalg.inv(ref_c2w)
@@ -217,109 +276,82 @@ class GoogleStreetDataset(BaseDataset):
         sat_part = sorted(sat_sel, key=self.natural_key)
         grd_uav_part = list(ground_sel) + list(uav_sel)
         rng.shuffle(grd_uav_part)  # random order among ground/uav only
-        sorted_files = sat_part + grd_uav_part
+        sorted_prefixes = sat_part + grd_uav_part
         # Safety: enforce final length.
-        sorted_files = sorted_files[:n_views]
+        sorted_prefixes = sorted_prefixes[:n_views]
 
         # 分开存储：卫星视图 vs 地面/无人机视图
         satellite_views = []
         ground_drone_views = []
 
-        for idx, npy_name in enumerate(sorted_files):
-            prefix = npy_name.replace('_rgb.npy', '')
+        for prefix in sorted_prefixes:
+            # One LMDB get() per view; unpickle yields fresh numpy arrays.
+            blob = self._load_view_blob(txn, folder_path, prefix)
+            K = blob['K'].copy()
+            c2w = blob['c2w']
+            rgb = blob['rgb']         # (H, W, 3) uint8, pre-resized
+            depth = blob['depth']     # (H, W) float32, pre-resized + pre-clipped
+            is_sat = bool(blob['s'])
 
-            # A. 加载内参(K)和外参(c2w)
-            meta = np.load(self.get_file_content(txn, os.path.join(folder_path, npy_name)), allow_pickle=True).item()
-            K, c2w = meta['intrinsics'].copy(), meta['c2w'].copy()
-            
-            # 以参考相机(第一张地面图)为世界坐标系，计算相对的外参
+            # 以参考相机(第一张地面图)为世界坐标系，计算相对的外参。
             c2w = ref_w2c @ c2w
 
-            # B. 极速加载深度图
-            if 'ground' in prefix and 'satellite' not in prefix:  
-                # 优化点 1: weights_only=True 加速安全反序列化
-                temp_depth_tensor = torch.load(
-                    self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth_dap.pt")), 
-                    map_location='cpu', 
-                    weights_only=True
+            if is_sat:
+                # Sat RGB is already at SAT_TARGET (1024). Apply the random
+                # meter-based crop + resize the same way as before — only now
+                # sat_W / sat_H are the pre-resized dimensions (1024), which
+                # keeps the focal-length formula self-consistent.
+                sat_H, sat_W = rgb.shape[0], rgb.shape[1]
+                sat_meter_per_pixel = SAT_RES / sat_H
+                sat_target_size = int(current_sat_meters / sat_meter_per_pixel)
+
+                pixel_shift_x = int(shift_east / sat_meter_per_pixel)
+                pixel_shift_y = int(shift_south / sat_meter_per_pixel)
+
+                center_x = sat_W // 2 + pixel_shift_x
+                center_y = sat_H // 2 + pixel_shift_y
+
+                crop_left = int(center_x - sat_target_size // 2)
+                crop_top = int(center_y - sat_target_size // 2)
+
+                assert crop_left >= 0 and crop_top >= 0 \
+                    and crop_left + sat_target_size <= sat_W \
+                    and crop_top + sat_target_size <= sat_H, \
+                    f"Crop box out of bounds: left={crop_left}, top={crop_top}, target_size={sat_target_size}"
+
+                # RGB crop + LANCZOS upscale back to 1024x1024. cv2.INTER_LANCZOS4
+                # is the same quality class as PIL.LANCZOS but ~3x faster.
+                rgb_crop = np.ascontiguousarray(
+                    rgb[crop_top:crop_top + sat_target_size, crop_left:crop_left + sat_target_size]
                 )
-                # 优化点 2: 用 .any() 极速判断张量是否非空
-                if not temp_depth_tensor.any():
-                    depth = np.load(self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth.npy"))).astype(np.float32)
-                else:
-                    depth = temp_depth_tensor.detach().numpy().astype(np.float32)
-                # depth = np.load(os.path.join(folder_path, f"{prefix}_depth.npy")).astype(np.float32)
-                depth[depth > 60] = -1
-            else:
-                depth = np.load(self.get_file_content(txn, os.path.join(folder_path, f"{prefix}_depth.npy"))).astype(np.float32)
-                if 'uav' in prefix:
-                    depth[depth > 300] = -1
-            # C. 安全加载并裁剪 RGB 图像
-            rgb_file = f"{prefix}.jpg" if "satellite" in prefix else f"{prefix}_rgb.jpg"
-            rgb_path = os.path.join(folder_path, rgb_file)
-            
-            # 优化点 3: 使用 with 语句，确保文件句柄在使用后立刻释放，防止系统 Cache 溢出
-            with Image.open(self.get_file_content(txn, rgb_path)) as img:
-                rgb = img.convert('RGB')
-                
-                if "satellite" in prefix:
-                    is_sat = True
-                    sat_H, sat_W = rgb.size[1], rgb.size[0]
-                    sat_meter_per_pixel = SAT_RES / sat_H  
-                    sat_target_size = int(current_sat_meters / sat_meter_per_pixel)
+                rgb = cv2.resize(rgb_crop, (1024, 1024), interpolation=cv2.INTER_LANCZOS4)
 
-                    pixel_shift_x = int(shift_east / sat_meter_per_pixel)
-                    pixel_shift_y = int(shift_south / sat_meter_per_pixel)
-                    
-                    center_x = sat_W // 2 + pixel_shift_x
-                    center_y = sat_H // 2 + pixel_shift_y
+                # Update intrinsics + shift the pose.
+                K[0, 0] *= sat_W / sat_target_size
+                K[1, 1] *= sat_H / sat_target_size
+                c2w = c2w.copy()
+                c2w[0, 3] += shift_south
+                c2w[2, 3] += shift_east
 
-                    crop_left = int(center_x - sat_target_size // 2)
-                    crop_top = int(center_y - sat_target_size // 2)
-
-                    assert crop_left >= 0 and crop_top >= 0 and crop_left + sat_target_size <= sat_W and crop_top + sat_target_size <= sat_H, \
-                        f"Crop box out of bounds: left={crop_left}, top={crop_top}, target_size={sat_target_size}"
-                    
-                    # RGB 裁剪与缩放
-                    rgb = TF.crop(rgb, crop_top, crop_left, sat_target_size, sat_target_size)
-                    rgb = rgb.resize((1024, 1024), resample=Image.LANCZOS)                
-
-                    # 更新相机内外参
-                    K[0, 0] *= sat_W / sat_target_size  
-                    K[1, 1] *= sat_H / sat_target_size  
-                    c2w[0, 3] += shift_south
-                    c2w[2, 3] += shift_east
-
-                    # 优化点 4: 彻底摒弃 F.interpolate 产生巨大无用张量的逻辑
-                    # 采用先按比例推算小图坐标 -> 小图上直接裁剪 -> cv2 高速放大的策略
-                    depth_H, depth_W = depth.shape
-                    scale_x = depth_W / sat_W
-                    scale_y = depth_H / sat_H
-
-                    d_crop_left = int(crop_left * scale_x)
-                    d_crop_top = int(crop_top * scale_y)
-                    d_crop_w = int(sat_target_size * scale_x)
-                    d_crop_h = int(sat_target_size * scale_y)
-
-                    depth_crop = depth[d_crop_top : d_crop_top + d_crop_h, d_crop_left : d_crop_left + d_crop_w]
-                    
-                    # 使用 cv2 极速最近邻插值到 1024x1024
-                    depth = cv2.resize(depth_crop, (1024, 1024), interpolation=cv2.INTER_NEAREST)
-
-                else:
-                    is_sat = False
-
-                # 将最终的 RGB 转回 numpy 数组
-                rgb = np.array(rgb)
+                # Depth: crop the matching region and nearest-upsample to 1024.
+                depth_H, depth_W = depth.shape
+                scale_x = depth_W / sat_W
+                scale_y = depth_H / sat_H
+                d_crop_left = int(crop_left * scale_x)
+                d_crop_top = int(crop_top * scale_y)
+                d_crop_w = int(sat_target_size * scale_x)
+                d_crop_h = int(sat_target_size * scale_y)
+                depth_crop = depth[d_crop_top:d_crop_top + d_crop_h, d_crop_left:d_crop_left + d_crop_w]
+                depth = cv2.resize(depth_crop, (1024, 1024), interpolation=cv2.INTER_NEAREST)
 
             # 数据增强与统一后处理
             rgb, depth, K = self._crop_resize_if_necessary(
-                rgb, 
-                depth, 
-                K, 
-                resolution, 
-                rng=rng, 
-                info=folder_path, 
+                rgb,
+                depth,
+                K,
+                resolution,
+                rng=rng,
+                info=folder_path,
                 sat=is_sat,
             )
 
