@@ -1,0 +1,28 @@
+# @package _global_
+# C1_highres: Stage-2 high-resolution + dynamic-resolution training.
+# Continues from C1 best_model. Uses train_pi3_highres for resolution settings.
+defaults:
+  - model: pi3_googlestreet_sat_C1_highres.yaml
+  - train: train_pi3_highres       # ← dynamic resolution, max_img_per_gpu=24, image_num_range=[2,24]
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C1_highres
+
+# Override train_pi3_highres defaults: keep image_num_range = [2, 3] like lowres,
+# only adopt the dynamic resolution part of high-res config.
+train:
+    image_num_range: [2, 3]
+    max_img_per_gpu: 24          # match original train_pi3_highres budget
+    pixel_count_range: [100000, 255000]  # original train_pi3_highres
+    iters_per_epoch: 170         # same as lowres (sub-sampled epoch)
+    num_epoch: 30                # 30 × 170 = 5100 steps
+
+# IMPORTANT: train_pi3_highres.yaml sets model.ckpt: null, which overrides our
+# model config. Re-declare ckpt here in _self_ so it wins.
+model:
+    ckpt: /home/wangqw/video_program/Pi3/outputs/saved_runs/C1/ckpts/best_model/pytorch_model.bin

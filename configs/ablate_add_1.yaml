@@ -1,0 +1,13 @@
+# @package _global_
+# ADD-1: ADD-0 + double_register module
+defaults:
+  - model: pi3_googlestreet_sat_ablate_add_1.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml  # ← use_sat=true (needed for is_sat_mask)
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/add_1

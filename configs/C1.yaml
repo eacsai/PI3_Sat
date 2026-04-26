@@ -1,0 +1,13 @@
+# @package _global_
+# C1: Ablate-F + dual camera head (separate camera_head_sat for sat views)
+defaults:
+  - model: pi3_googlestreet_sat_C1.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C1

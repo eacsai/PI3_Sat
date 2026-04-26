@@ -450,7 +450,12 @@ class BaseTrainer:
             if np.isscalar(v):
                 log_scaler[prefix+'/'+k] = v
                 continue
-            if Image.isImageType(v):
+            # 0-D tensor (e.g. loss component) → log as scalar
+            if hasattr(v, 'numel') and hasattr(v, 'item') and v.numel() == 1:
+                log_scaler[prefix+'/'+k] = float(v.item())
+                continue
+            # PIL.Image (PIL 10+ removed Image.isImageType; use isinstance)
+            if isinstance(v, Image.Image):
                 log_img[prefix+'/'+k] = v
 
         self.accelerator.log(log_scaler, step)

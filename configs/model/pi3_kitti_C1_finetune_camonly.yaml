@@ -1,0 +1,97 @@
+# @package _global_
+# KITTI fine-tune of C1_highres with camera-branch-only training.
+# Point branch (point_decoder/point_head/sat_register_inject) and
+# shared backbone (encoder/decoder/ms_fusion/register_token/sat_pos_embedder)
+# are frozen via Pi3KittiTrainer.freeze_point_branch — only the camera
+# decoder, both camera heads, and sat_mpp_head learn from KITTI.
+model:
+    _target_: pi3.models.pi3_training_sat.Pi3
+    pos_type: rope100
+    decoder_size: large
+    load_pi3: false
+    freeze_encoder: false   # Pi3KittiTrainer freezes it explicitly
+    train_conf: false
+    num_dec_blk_not_to_checkpoint: 4
+    ckpt: /home/wangqw/video_program/Pi3/outputs/saved_runs/C1_highres/ckpts/best_model/pytorch_model.bin
+    ablate_msfusion: false
+    ablate_satinject: false
+    ablate_satposembed: false
+    ablate_double_register: false
+    ablate_ortho: false
+    depth_activation: softplus
+    use_dual_camera_head: true
+    use_sat_camera_inject: false
+    sat_head_constrained: false
+    use_geo_xattn: false
+    sat_head_residual: false
+
+loss:
+    train_loss:
+        _target_: pi3.models.loss_kitti.Pi3KittiLoss
+        trans_alpha: 100.0
+        camera_weight: 0.1     # mirrors Pi3Loss's `camera_loss * 0.1`
+        proj_weight: 0.0       # disabled (sat_mpp_head can't reach KITTI's 0.2 m/px)
+
+    test_loss:
+        _target_: pi3.models.loss_kitti.Pi3KittiLoss
+        trans_alpha: 100.0
+        camera_weight: 0.1
+        proj_weight: 0.0
+
+train:
+    num_workers: 8
+    batch_size: 1
+    num_epoch: 30
+    iters_per_epoch: 40    # 128/2 * 40 = 2560 < 2807 (per-rank dataset cap)
+
+    print_freq: 10
+    base_seed: 666
+
+    model_dtype: bf16
+    dynamo_backend: NO
+    dynamic_compile: true
+
+    gradient_accumulation_steps: 1
+    clip_grad: 10.0
+    clip_loss: 2000     # KITTI initial loss is large; clip only outliers
+
+    seed: 42
+    resume: null
+    auto_resume: true
+    start_epoch: 0
+    global_step: 0
+    world_size: 1
+    rank: -1
+    gpu: -1
+    dist_on_itp: false
+    find_unused_parameters: true
+
+    distributed: false
+    dist_url: env://
+    dist_backend: "nccl"
+
+    freeze_point_branch: true   # ← key flag
+
+    optimizer:
+        type: AdamW
+        lr: 5e-5
+        weight_decay: 5e-2
+        betas: [0.9, 0.95]
+        verbose: true
+        filter_bias_and_bn: true
+        encoder_lr: 5e-6        # unused (encoder frozen)
+
+    lr_scheduler:
+        type: OneCycleLR
+        max_lr: ${train.optimizer.lr}
+        pct_start: 0.0
+        anneal_strategy: cos
+        div_factor: 1000.0
+        final_div_factor: 100.0
+        total_steps: -1
+
+test:
+    num_workers: 2
+    batch_size: 1
+    print_freq: 10
+    iters_per_test: -1

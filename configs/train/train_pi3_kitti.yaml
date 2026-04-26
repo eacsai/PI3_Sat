@@ -1,0 +1,15 @@
+# @package _global_
+# KITTI cross-view fine-tune: 504x504 fixed resolution, 2 views, no point GT.
+
+trainer: trainers.pi3_kitti_trainer.Pi3KittiTrainer
+
+train:
+  image_num_range: [2, 2]      # always (sat, ground) pair
+  max_img_per_gpu: 128         # 64 pairs/GPU → total batch = 448 across 7 GPUs
+  random_reslution: false      # fixed resolution per epoch
+  resolution:                  # passed straight to dataset.__init__
+    - [504, 252]               # (W, H)
+  num_resolution: 1
+  patch_size: 14
+  pixel_count_range: [127000, 127017]
+  aspect_ratio_range: [2.0, 2.0]

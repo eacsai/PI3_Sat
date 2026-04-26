@@ -1,0 +1,13 @@
+# @package _global_
+# ADD_dr_ortho: double_register + ortho_sat combined, on top of ADD-0 baseline.
+defaults:
+  - model: pi3_googlestreet_sat_ablate_add_dr_ortho.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/add_dr_ortho

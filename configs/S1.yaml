@@ -1,0 +1,13 @@
+# @package _global_
+# S1: C1 + sat camera DOF constrained to (x, y, z, yaw) + shared learnable world R
+defaults:
+  - model: pi3_googlestreet_sat_S1.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/S1

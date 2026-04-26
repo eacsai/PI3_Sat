@@ -1,0 +1,18 @@
+# @package _global_
+# Top-level: KITTI cross-view fine-tune of C1_highres (no point GT).
+defaults:
+  - model: pi3_kitti_C1_finetune.yaml
+  - train: train_pi3_kitti
+  - data: kitti_pair.yaml
+  - general: kitti_pair.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/kitti_C1_finetune
+
+# Re-declare ckpt: train_pi3_kitti doesn't touch model.ckpt, but be explicit
+# in case the order of defaults shifts later.
+model:
+    ckpt: /home/wangqw/video_program/Pi3/outputs/saved_runs/C1_highres/ckpts/best_model/pytorch_model.bin

@@ -1,0 +1,13 @@
+# @package _global_
+# C2_nogate (V2): C2 with gates + zero-init removed on both sat injections.
+defaults:
+  - model: pi3_googlestreet_sat_C2_nogate.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C2_nogate

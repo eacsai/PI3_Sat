@@ -1,47 +1,48 @@
 # @package _global_
-
+# ADD-2: ADD-0 + ms_fusion (double_register dropped after ADD-1 failed).
 model:
-    _target_: pi3.models.pi3_training.Pi3
+    _target_: pi3.models.pi3_training_sat.Pi3
     pos_type: rope100
     decoder_size: large
     load_pi3: true
     freeze_encoder: true
-    use_global_points: false
     train_conf: false
     num_dec_blk_not_to_checkpoint: 4
-    ckpt: null # <path-to-your-pretrain-checkpoint>
+    ckpt: null
+    ablate_msfusion: false  # ← enabled
+    ablate_satinject: true
+    ablate_satposembed: true
+    ablate_double_register: true
+    ablate_ortho: true
 
 loss:
-    train_loss: 
+    train_loss:
         _target_: pi3.models.loss.Pi3Loss
         train_conf: false
-        normal_loss_start_epoch: 5   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
+        normal_loss_start_epoch: 5
 
     test_loss:
         _target_: pi3.models.loss.Pi3Loss
         train_conf: false
-        normal_loss_start_epoch: 0   # 0-based：epoch 0~4 不算法向，从 epoch 5 开始
+        normal_loss_start_epoch: 0
 
 train:
-    # TODO: DEBUG CHANGE
-    num_workers: 2 # debug use 0
-    batch_size: 1              # not use, dynamic batch size
+    num_workers: 2
+    batch_size: 1
     num_epoch: 30
-    iters_per_epoch: 170 # 70 Original and 170 All and 110 60%
+    iters_per_epoch: 170
 
     print_freq: 10
     base_seed: 666
 
     model_dtype: bf16
-    # dynamic complie
-    dynamo_backend: NO  # CUDAGRAPHS  # INDUCTOR  # NO
+    dynamo_backend: NO
     dynamic_compile: true
 
-    # Training config
     gradient_accumulation_steps: 1
     clip_grad: 10.0
     clip_loss: 10
-    
+
     seed: 42
     resume: null
     auto_resume: true
@@ -51,23 +52,19 @@ train:
     rank: -1
     gpu: -1
     dist_on_itp: false
-    # 多卡训练：模型存在条件分支/部分层未参与某次 loss 时需为 true，否则 DDP 报 reduction 错误
     find_unused_parameters: true
 
-    # for distributed training
     distributed: false
     dist_url: env://
     dist_backend: "nccl"
 
-    # Optimizer config
     optimizer:
         type: AdamW
-        lr: 5e-5  # Original 5e-5, All 1e-4
+        lr: 5e-5
         weight_decay: 5e-2
         betas: [0.9, 0.95]
         verbose: true
         filter_bias_and_bn: true
-
         encoder_lr: 5e-6
 
     lr_scheduler:
@@ -80,8 +77,7 @@ train:
         total_steps: -1
 
 test:
-    # TODO: DEBUG CHANGE
-    num_workers: 2              # 16
-    batch_size: 1              # not use, dynamic batch size
+    num_workers: 2
+    batch_size: 1
     print_freq: 10
     iters_per_test: -1

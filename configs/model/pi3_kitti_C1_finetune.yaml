@@ -1,0 +1,93 @@
+# @package _global_
+# Fine-tune C1_highres on KITTI cross-view (sat+ground) with no point-cloud GT.
+# Architecture identical to C1_highres; backbone is unfrozen for KITTI domain
+# adaptation, encoder LR is kept small to avoid wrecking DINOv2 priors.
+model:
+    _target_: pi3.models.pi3_training_sat.Pi3
+    pos_type: rope100
+    decoder_size: large
+    load_pi3: false   # init from C1_highres ckpt, not raw Pi3
+    freeze_encoder: false   # ← unfreeze; user said backbone can move
+    train_conf: false
+    num_dec_blk_not_to_checkpoint: 4
+    ckpt: /home/wangqw/video_program/Pi3/outputs/saved_runs/C1_highres/ckpts/best_model/pytorch_model.bin
+    ablate_msfusion: false
+    ablate_satinject: false
+    ablate_satposembed: false
+    ablate_double_register: false
+    ablate_ortho: false
+    depth_activation: softplus
+    use_dual_camera_head: true
+    use_sat_camera_inject: false
+    sat_head_constrained: false
+    use_geo_xattn: false
+    sat_head_residual: false
+
+loss:
+    train_loss:
+        _target_: pi3.models.loss_kitti.Pi3KittiLoss
+        trans_alpha: 100.0
+        proj_weight: 1.0
+        proj_huber_delta: 0.05
+
+    test_loss:
+        _target_: pi3.models.loss_kitti.Pi3KittiLoss
+        trans_alpha: 100.0
+        proj_weight: 1.0
+        proj_huber_delta: 0.05
+
+train:
+    num_workers: 2
+    batch_size: 1
+    num_epoch: 20
+    iters_per_epoch: 200
+
+    print_freq: 10
+    base_seed: 666
+
+    model_dtype: bf16
+    dynamo_backend: NO
+    dynamic_compile: true
+
+    gradient_accumulation_steps: 1
+    clip_grad: 10.0
+    clip_loss: 2000     # KITTI initial loss is large (trans*100); clip only outliers
+
+    seed: 42
+    resume: null
+    auto_resume: true
+    start_epoch: 0
+    global_step: 0
+    world_size: 1
+    rank: -1
+    gpu: -1
+    dist_on_itp: false
+    find_unused_parameters: true
+
+    distributed: false
+    dist_url: env://
+    dist_backend: "nccl"
+
+    optimizer:
+        type: AdamW
+        lr: 5e-5
+        weight_decay: 5e-2
+        betas: [0.9, 0.95]
+        verbose: true
+        filter_bias_and_bn: true
+        encoder_lr: 5e-6        # small LR for DINOv2 backbone
+
+    lr_scheduler:
+        type: OneCycleLR
+        max_lr: ${train.optimizer.lr}
+        pct_start: 0.0
+        anneal_strategy: cos
+        div_factor: 1000.0
+        final_div_factor: 100.0
+        total_steps: -1
+
+test:
+    num_workers: 2
+    batch_size: 1
+    print_freq: 10
+    iters_per_test: -1

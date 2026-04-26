@@ -1,0 +1,69 @@
+# @package _global_
+
+train_dataset:
+    length: 50000
+
+    weights:
+        KittiPair: 50000
+
+    KittiPair:
+        _target_: datasets.kitti_pair_dataset.KittiPairDataset
+        root: /data/dataset/KITTI_dataset/KITTI
+        split: train
+        shift_range_lat: 20.0
+        shift_range_lon: 20.0
+        rotation_range: 10.0
+        sat_height: 150.0
+        camera_height: 0.0
+        use_orig_ground: false
+        ground_isotropic_resize: false
+        z_far: 0
+        frame_num: 2
+        aug_crop: 0
+        aug_focal: false
+        use_query: false
+        use_sat: true
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        mode: 'train'
+        shuffle: false
+        query_sample_count: 8192
+
+train_dataloader:
+    drop_last: True
+    shuffle: True
+
+test_dataset:
+    weights:
+        KittiPair: 200
+
+    KittiPair:
+        _target_: datasets.kitti_pair_dataset.KittiPairDataset
+        root: /data/dataset/KITTI_dataset/KITTI
+        split: test1
+        shift_range_lat: 20.0
+        shift_range_lon: 20.0
+        rotation_range: 10.0
+        sat_height: 150.0
+        camera_height: 0.0
+        use_orig_ground: false
+        ground_isotropic_resize: false
+        z_far: 0
+        frame_num: 2
+        aug_crop: 0
+        aug_focal: false
+        use_query: false
+        use_sat: true
+        resolution:
+            - [504, 252]   # (W, H)
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+        shuffle: false
+        query_sample_count: 8192
+
+test_dataloader:
+    drop_last: False
+    shuffle: False

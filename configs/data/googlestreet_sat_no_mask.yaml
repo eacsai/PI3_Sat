@@ -1,21 +1,23 @@
 # @package _global_
+# Identical to googlestreet_sat.yaml but use_sat=false → no is_sat_mask passed to model.
+# Used for ADD-0 baseline (true Pi3_ori-equivalent on the same view structure).
 
 train_dataset:
-    length: 39000         # 8000 Original and 39000 All and 23400 60%
+    length: 39000
 
-    weights: 
-        GoogleStreet: 39000         # 8000 Original and 39000 All and 23400 60%
+    weights:
+        GoogleStreet: 39000
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
-        data_root: /data/zhongyao/dataset/ # 修改为你的 MegaDepth 数据集路径
+        data_root: /data/zhongyao/dataset/
         split: True
         shift_range: 20
         z_far: 30000
         frame_num: 3
         aug_crop: 16
         use_query: false
-        use_sat: false
+        use_sat: false  # ← key change: no is_sat_mask
         transform:
             _partial_: true
             _target_: datasets.base.transforms.JitterJpegLossBlurring
@@ -29,18 +31,18 @@ train_dataloader:
     shuffle: True
 
 test_dataset:
-    weights: 
+    weights:
         GoogleStreet: 450
 
     GoogleStreet:
         _target_: datasets.googlestreet_dataset.GoogleStreetDataset
-        data_root: /data/zhongyao/dataset/  # 修改为你的 MegaDepth 数据集路径
+        data_root: /data/zhongyao/dataset/
         split: True
         shift_range: 20
         z_far: 30000
         frame_num: 3
         use_query: false
-        use_sat: false
+        use_sat: false  # ← key change
         resolution:
             - [252, 252]
         transform:

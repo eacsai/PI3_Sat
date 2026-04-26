@@ -1,0 +1,13 @@
+# @package _global_
+# C3b: C1 + sat head as residual on learnable anchor pose (soft sat prior)
+defaults:
+  - model: pi3_googlestreet_sat_C3b.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C3b

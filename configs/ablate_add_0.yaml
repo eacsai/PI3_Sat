@@ -1,0 +1,14 @@
+# @package _global_
+# ADD-0: Pi3_ori-equivalent baseline (no sat modules, loss.py, use_sat=false).
+defaults:
+  - model: pi3_googlestreet_sat_ablate_add_0.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat_no_mask.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+# Output dir = outputs/saved_runs/add_0/
+name: saved_runs/add_0

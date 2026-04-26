@@ -1,0 +1,13 @@
+# @package _global_
+# S2: C1 + grd→sat spatial cross-attention (geolocalization xattn)
+defaults:
+  - model: pi3_googlestreet_sat_S2.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/S2

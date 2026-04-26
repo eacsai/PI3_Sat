@@ -1,0 +1,13 @@
+# @package _global_
+# C1 minus sat_register_inject (point path): tests if removing point-side sat injection helps.
+defaults:
+  - model: pi3_googlestreet_sat_C1_no_satinject.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C1_no_satinject

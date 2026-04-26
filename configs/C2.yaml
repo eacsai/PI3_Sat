@@ -1,0 +1,13 @@
+# @package _global_
+# C2 = C1 + sat→grd cross-attention injection on camera_hidden (Plan B option 2)
+defaults:
+  - model: pi3_googlestreet_sat_C2.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C2

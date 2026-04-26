@@ -10,7 +10,7 @@ from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextTransformerDecoder
-from .layers.camera_head import CameraHead, CameraHeadSatConstrained, CameraHeadSatResidual, ResConvBlock
+from .layers.camera_head import CameraHead, ResConvBlock
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
@@ -18,7 +18,6 @@ from .sat_position import FourierEmbedder
 
 MIN_MPP = 0.005
 MAX_MPP = 0.05
-
 class MultiScaleFusion(nn.Module):
     """Softmax-gated fusion of features from multiple decoder layers."""
 
@@ -35,78 +34,81 @@ class MultiScaleFusion(nn.Module):
         return sum(w * f for w, f in zip(weights, feats))
 
 
-class GeoLocalizationXAttn(nn.Module):
-    """S2: spatial cross-attention from grd camera tokens to sat patch features.
+class DepthRefinementTransformer(nn.Module):
+    """Lightweight self-attention refinement of point features."""
 
-    Each grd view's tokens query sat patches → 'where am I in the sat?'.
-    gate init=0 → safe identity at start. patch_start_idx skips register tokens.
-    """
-    def __init__(self, dim: int = 512, num_heads: int = 4, num_register: int = 5):
+    def __init__(self, dim: int = 1024, hidden_dim: int = 512,
+                 num_heads: int = 8, num_layers: int = 2, rope=None):
         super().__init__()
-        self.num_register = num_register
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.gate = nn.Parameter(torch.zeros(1))
+        self.proj_in = nn.Linear(dim, hidden_dim)
+        self.layers = nn.ModuleList([
+            BlockRope(
+                dim=hidden_dim, num_heads=num_heads, mlp_ratio=4,
+                qkv_bias=True, proj_bias=True, ffn_bias=True,
+                drop_path=0.0,
+                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                act_layer=nn.GELU, ffn_layer=Mlp,
+                init_values=None, qk_norm=True,
+                attn_class=FlashAttentionRope, rope=rope,
+            ) for _ in range(num_layers)
+        ])
+        self.proj_out = nn.Linear(hidden_dim, dim)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
 
-    def forward(self, camera_hidden: torch.Tensor, is_sat_mask: torch.Tensor) -> torch.Tensor:
-        BN, S, D = camera_hidden.shape
-        B, N = is_sat_mask.shape
-        ph = camera_hidden.view(B, N, S, D)
-        sat_w = is_sat_mask.to(ph.dtype).view(B, N, 1, 1)
-        # Sat patch tokens (skip register): (B, N, P, D)
-        sat_patches = ph[:, :, self.num_register:, :]
-        sat_w_sum = sat_w.sum(dim=1).clamp_min(1.0)             # (B, 1, 1)
-        sat_kv = (sat_patches * sat_w).sum(dim=1) / sat_w_sum    # (B, P, D)
-        # Build K/V (one per batch, repeated for each view in cross-attention)
-        kv = self.norm_kv(sat_kv).repeat_interleave(N, dim=0)    # (B*N, P, D)
-        q = self.norm_q(camera_hidden)                           # (B*N, S, D)
-        residual, _ = self.attn(q, kv, kv)                       # (B*N, S, D)
-        # Mask: only inject into ground (non-sat) views
-        grd_mask = (~is_sat_mask).to(ph.dtype).view(B, N, 1, 1)
-        residual = residual.view(B, N, S, D) * grd_mask
-        out = ph + self.gate * residual
-        return out.view(BN, S, D)
+    def forward(self, x: torch.Tensor, xpos: torch.Tensor) -> torch.Tensor:
+        h = self.proj_in(x)
+        for layer in self.layers:
+            h = layer(h, xpos=xpos)
+        return x + self.proj_out(h)
 
 
-class SatRegisterInjection(nn.Module):
-    """Cross-view injection using satellite register tokens as global summary.
+class SatToGroundInjection(nn.Module):
+    """Cross-view injection: feed a satellite summary into ground/drone tokens.
 
-    Register tokens (first num_register positions) are learned global summary
-    tokens that aggregate information through the full decoder. They capture
-    scale, layout, and orientation — exactly what ground views need from sat.
+    The satellite view encodes an orthographic top-down map with explicit
+    ground sampling distance; its features carry strong global scale /
+    layout information that ground/drone views lack. We mean-pool sat
+    views' patch features into a single summary vector per batch, pass it
+    through a small MLP, and add a *gated* broadcast to every non-sat
+    view's token stream. The gate is zero-initialised, so the network
+    starts identical to baseline and can learn to open the channel as
+    needed during training.
     """
 
-    def __init__(self, dim: int = 1024, num_register: int = 5,
-                 use_gate: bool = True, zero_init_ffn: bool = True):
+    def __init__(self, dim: int = 1024):
         super().__init__()
-        self.num_register = num_register
         self.norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim),
             nn.GELU(),
             nn.Linear(dim, dim),
         )
-        if zero_init_ffn:
-            nn.init.zeros_(self.ffn[-1].weight)
-            nn.init.zeros_(self.ffn[-1].bias)
-        self.use_gate = use_gate
-        if use_gate:
-            self.gate = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+        self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, hidden: torch.Tensor, is_sat_mask: torch.Tensor) -> torch.Tensor:
+        # hidden: (B*N, S, D); is_sat_mask: (B, N) bool
         BN, S, D = hidden.shape
         B, N = is_sat_mask.shape
+        assert BN == B * N
+
         ph = hidden.view(B, N, S, D)
-        sat_w = is_sat_mask.to(ph.dtype).view(B, N)
-        sat_w_sum = sat_w.sum(dim=1, keepdim=True).clamp_min(1.0)
-        # Exp13: use only patch tokens (excluding register tokens) as summary
-        per_view_reg = ph[:, :, self.num_register:, :].mean(dim=2)  # (B, N, D)
-        sat_pooled = (per_view_reg * sat_w.unsqueeze(-1)).sum(dim=1) / sat_w_sum
-        injected = self.ffn(self.norm(sat_pooled))
-        injection = self.gate * injected if self.use_gate else injected
+        sat_w = is_sat_mask.to(ph.dtype).view(B, N)            # (B, N)
+        sat_w_sum = sat_w.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
+
+        # Mean over patch tokens per view, then weighted sat-only mean.
+        per_view_mean = ph.mean(dim=2)                          # (B, N, D)
+        sat_pooled = (per_view_mean * sat_w.unsqueeze(-1)).sum(dim=1) / sat_w_sum  # (B, D)
+
+        injected = self.ffn(self.norm(sat_pooled))              # (B, D)
+        injection = self.gate * injected                         # (B, D)
+
+        # Broadcast to ground/drone views only (sat rows keep 0 injection).
         ground_mask_f = (~is_sat_mask).to(ph.dtype).view(B, N, 1, 1)
-        broadcast = injection.view(B, 1, 1, D) * ground_mask_f
+        broadcast = injection.view(B, 1, 1, D) * ground_mask_f  # (B, N, S, D)
+
         return (ph + broadcast).view(BN, S, D)
 
 
@@ -129,20 +131,6 @@ class Pi3(nn.Module):
             train_conf=False,
             num_dec_blk_not_to_checkpoint=4,
             ckpt=None,
-            # --- Ablation flags (each disables ONE Exp13 module) ---
-            ablate_msfusion=False,            # disable MultiScaleFusion → concat last 2 layers
-            ablate_satinject=False,           # skip sat_register_inject call
-            ablate_satposembed=False,         # don't add sat Fourier position encoding
-            ablate_double_register=False,     # use single register_token (like original Pi3)
-            ablate_ortho=False,               # sat uses perspective like grd (no sat_mpp / sat_xy_base)
-            # --- Camera optimization flags (C-series) ---
-            depth_activation='exp',           # 'exp' (Pi3 default) or 'softplus' (Ablate-F)
-            use_dual_camera_head=False,       # C1: separate camera_head_sat for sat views
-            use_sat_camera_inject=False,      # C2: sat→grd injection in camera_hidden (mirror of sat_register_inject)
-            disable_inject_gate=False,        # C2_nogate (V2): drop gate + skip FFN zero-init on BOTH sat injections
-            sat_head_constrained=False,       # S1: replace camera_head_sat with 4-DOF constrained head
-            use_geo_xattn=False,              # S2: spatial cross-attn from grd cam tokens to sat patches
-            sat_head_residual=False,          # C3b: sat head as residual on top of learnable anchor pose
         ):
         super().__init__()
 
@@ -166,29 +154,11 @@ class Pi3(nn.Module):
         else:
             raise NotImplementedError
         
-        # Store ablation flags for use in decode/forward
-        self.ablate_msfusion = ablate_msfusion
-        self.ablate_satinject = ablate_satinject
-        self.ablate_satposembed = ablate_satposembed
-        self.ablate_double_register = ablate_double_register
-        self.ablate_ortho = ablate_ortho
-        # Camera optimization flags
-        assert depth_activation in ('exp', 'softplus'), f"Unknown depth_activation: {depth_activation}"
-        self.depth_activation = depth_activation
-        self.use_dual_camera_head = use_dual_camera_head
-        self.use_sat_camera_inject = use_sat_camera_inject
-        self.disable_inject_gate = disable_inject_gate
-        self.sat_head_constrained = sat_head_constrained
-        self.use_geo_xattn = use_geo_xattn
-        self.sat_head_residual = sat_head_residual
-        _inject_kwargs = dict(use_gate=not disable_inject_gate,
-                              zero_init_ffn=not disable_inject_gate)
-
         self.sat_pos_embedder = FourierEmbedder(
-            in_dim=2,
-            embed_dim=self.encoder.embed_dim,
-            num_freqs=64,
-            scale=1.5
+            in_dim=2, 
+            embed_dim=self.encoder.embed_dim, 
+            num_freqs=64, 
+            scale=1.5 
         )
 
         # ----------------------
@@ -235,9 +205,7 @@ class Pi3(nn.Module):
         # ----------------------
         num_register_tokens = 5
         self.patch_start_idx = num_register_tokens
-        # Ablation D: single register group (1,1,...) instead of double (1,2,...)
-        reg_dim_1 = 1 if ablate_double_register else 2
-        self.register_token = nn.Parameter(torch.randn(1, reg_dim_1, num_register_tokens, self.dec_embed_dim))
+        self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, self.dec_embed_dim))
         nn.init.normal_(self.register_token, std=1e-6)
 
         # ----------------------
@@ -251,19 +219,14 @@ class Pi3(nn.Module):
             rope=self.rope,
         )
         self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
-        # Exp12: MultiScaleFusion + SatRegisterInjection (register tokens only)
-        # Ablation A: disable MS fusion (use original Pi3 last-2-layers concat)
-        if not ablate_msfusion:
-            self.ms_collect_indices = (8, 17, 26, 34)
-            self.ms_fusion = MultiScaleFusion(dim=self.dec_embed_dim, num_layers=4, init_layer_idx=-1)
-        else:
-            # use last 2 layers like original Pi3
-            self.ms_collect_indices = (dec_depth - 2, dec_depth - 1)
-            self.ms_fusion = None
-        # Ablation B: SatPatchInjection (always create, conditionally call in forward)
-        self.sat_register_inject = SatRegisterInjection(dim=1024, num_register=num_register_tokens, **_inject_kwargs)
+        # Exp7: Exp3 (multi-scale fusion) + Exp4 (sat→ground injection) + Exp5 (depth refinement)
+        self.ms_collect_indices = (8, 17, 26, 34)
+        self.ms_fusion = MultiScaleFusion(dim=self.dec_embed_dim, num_layers=4, init_layer_idx=-1)
+        self.sat_to_ground_inject = SatToGroundInjection(dim=1024)
+        self.depth_refine = DepthRefinementTransformer(
+            dim=1024, hidden_dim=512, num_heads=8, num_layers=2, rope=self.rope,
+        )
         # 卫星分支：z 与地面/无人机共享 point_head 的输出；mpp 从 point_hidden 池化后回归
-        # Ablation E: when ablate_ortho, sat_mpp_head is unused (still created for state_dict compat, but never called)
         self.sat_mpp_head = nn.Sequential(
             nn.LayerNorm(1024),
             nn.Linear(1024, 256),
@@ -282,29 +245,6 @@ class Pi3(nn.Module):
             use_checkpoint=False
         )
         self.camera_head = CameraHead(dim=512)
-        # C1: separate camera head for sat views (initialized later from camera_head if load_pi3)
-        # S1: when sat_head_constrained, use 4-DOF top-down head instead of full CameraHead
-        # C3b: when sat_head_residual, use 6-DOF residual head (anchor + small delta)
-        if use_dual_camera_head:
-            if sat_head_constrained:
-                self.camera_head_sat = CameraHeadSatConstrained(dim=512)
-            elif sat_head_residual:
-                self.camera_head_sat = CameraHeadSatResidual(dim=512)
-            else:
-                self.camera_head_sat = CameraHead(dim=512)
-        else:
-            self.camera_head_sat = None
-        # C2: sat→grd injection on camera_hidden (mirrors sat_register_inject for point path).
-        # camera_decoder out_dim=512, so build a 512-dim version. gate init=0 → safe (=identity at start).
-        if use_sat_camera_inject:
-            self.sat_register_inject_camera = SatRegisterInjection(dim=512, num_register=num_register_tokens, **_inject_kwargs)
-        else:
-            self.sat_register_inject_camera = None
-        # S2: spatial cross-attention from grd camera tokens to sat patches
-        if use_geo_xattn:
-            self.geo_xattn = GeoLocalizationXAttn(dim=512, num_heads=4, num_register=num_register_tokens)
-        else:
-            self.geo_xattn = None
 
         # For ImageNet Normalize
         image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -328,7 +268,7 @@ class Pi3(nn.Module):
             freeze_all_params([
                 self.encoder, self.decoder,
                 self.point_decoder, self.point_head,
-                self.ms_fusion, self.sat_register_inject,
+                self.ms_fusion, self.sat_to_ground_inject, self.depth_refine,
                 self.sat_mpp_head,
                 self.camera_decoder, self.camera_head,
                 self.register_token, self.sat_pos_embedder,
@@ -390,49 +330,26 @@ class Pi3(nn.Module):
             if res.missing_keys:
                 print("================================================")
                 print("[Pi3] Missing keys (in model but not in ckpt):", res.missing_keys)
-            # C1: copy camera_head weights to camera_head_sat (warm start)
-            # — only when shapes match (i.e. NOT for S1 constrained head, which has different architecture)
-            if self.camera_head_sat is not None and not self.sat_head_constrained and not self.sat_head_residual:
-                self.camera_head_sat.load_state_dict(self.camera_head.state_dict())
-                print("[Pi3] camera_head_sat initialized from camera_head weights")
-            elif self.camera_head_sat is not None and (self.sat_head_constrained or self.sat_head_residual):
-                # Partial warm start: copy res_conv + avgpool + more_mlps from camera_head (shared structure)
-                src = self.camera_head.state_dict()
-                tgt = self.camera_head_sat.state_dict()
-                copied = []
-                for k in tgt:
-                    if k in src and src[k].shape == tgt[k].shape:
-                        tgt[k] = src[k]
-                        copied.append(k)
-                self.camera_head_sat.load_state_dict(tgt)
-                tag = "constrained" if self.sat_head_constrained else "residual"
-                print(f"[Pi3] camera_head_sat ({tag}) partial warm start: {len(copied)} tensors copied")
 
-    def decode(self, hidden, N, H, W, is_sat_mask=None, sat_pos_embed=None):
+    def decode(self, hidden, N, H, W, is_sat_mask, sat_pos_embed=None):
         BN, hw, _ = hidden.shape
         B = BN // N
+
         hidden = hidden.reshape(B*N, hw, -1)
 
-        # Ablation D: single register group → use register_token directly for all views
-        # Also fall back to single register when is_sat_mask is None (true Pi3_ori-equivalent)
-        if self.ablate_double_register or is_sat_mask is None:
-            # register_token shape (1, 1, tokens, dim) — replicate for all (B, N) views
-            register_token = self.register_token[:, 0:1].expand(B, N, -1, -1).reshape(
-                B * N, *self.register_token.shape[-2:])
-        else:
-            # 使用 is_sat_mask 精确区分：所有卫星视图共用同一组 register_token，其它视图共用另一组
-            # 1. 取出两个模板 token 组：sat / non-sat -> shape (1, 1, tokens, dim)
-            reg_token_sat = self.register_token[:, 0:1]
-            reg_token_non_sat = self.register_token[:, 1:2]
+        # 使用 is_sat_mask 精确区分：所有卫星视图共用同一组 register_token，其它视图共用另一组
+        # 1. 取出两个模板 token 组：sat / non-sat -> shape (1, 1, tokens, dim)
+        reg_token_sat = self.register_token[:, 0:1]
+        reg_token_non_sat = self.register_token[:, 1:2]
 
-            # 2. 扩展到 (B, N, tokens, dim)，按 is_sat_mask 选择
-            reg_token_sat = reg_token_sat.expand(B, N, -1, -1)
-            reg_token_non_sat = reg_token_non_sat.expand(B, N, -1, -1)
+        # 2. 扩展到 (B, N, tokens, dim)，按 is_sat_mask 选择
+        reg_token_sat = reg_token_sat.expand(B, N, -1, -1)
+        reg_token_non_sat = reg_token_non_sat.expand(B, N, -1, -1)
 
-            mask = is_sat_mask.to(hidden.device).view(B, N, 1, 1)
-            register_token = torch.where(mask, reg_token_sat, reg_token_non_sat)
-            # 展平为 (B*N, tokens, dim) 以适配后续的计算
-            register_token = register_token.reshape(B*N, *self.register_token.shape[-2:])
+        mask = is_sat_mask.to(hidden.device).view(B, N, 1, 1)
+        register_token = torch.where(mask, reg_token_sat, reg_token_non_sat)
+        # 展平为 (B*N, tokens, dim) 以适配后续的计算
+        register_token = register_token.reshape(B*N, *self.register_token.shape[-2:])
 
         # Concatenate special tokens with patch tokens
         hidden = torch.cat([register_token, hidden], dim=1)
@@ -476,6 +393,7 @@ class Pi3(nn.Module):
             pos_special = torch.zeros(B * N, self.patch_start_idx, 2).to(hidden.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
        
+        # Exp7: collect features at multiple depths + the final layer.
         ms_collected = []
         last_hidden = None
         for i in range(len(self.decoder)):
@@ -498,16 +416,13 @@ class Pi3(nn.Module):
             if i == len(self.decoder) - 1:
                 last_hidden = hidden.reshape(B*N, hw, -1)
 
-        # Ablation A: when MS disabled, ms_collected has 2 entries (last-2 + last) — concat them like original Pi3
-        if self.ablate_msfusion or self.ms_fusion is None:
-            return torch.cat([ms_collected[0], ms_collected[1]], dim=-1), pos.reshape(B*N, hw, -1)
-        fused = self.ms_fusion(ms_collected)
+        fused = self.ms_fusion(ms_collected)  # (B*N, hw, dim)
         return torch.cat([fused, last_hidden], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self,
+    def forward(self, 
                 imgs,
-                is_sat_mask=None,  # [B, N] bool — 可选,None 时所有 sat 路径自动跳过
-        ):
+                is_sat_mask, # [B, N] bool
+        ):  # [关键修改] 加入 queries 和 is_sat_mask 参数
 
         imgs = (imgs - self.image_mean) / self.image_std
 
@@ -533,17 +448,17 @@ class Pi3(nn.Module):
         
         # 保存下来供 decode 循环使用
         sat_pos_embed = sat_pos_embed.reshape(B, patch_h * patch_w, -1)
-        # Ablation C: skip sat positional encoding entirely
-        if self.ablate_satposembed:
-            sat_pos_embed = None
         # 将 sat_pos_embed 传给 decode，并用 is_sat_mask 控制哪些视图叠加卫星位置编码
         hidden, pos = self.decode(hidden, N, H, W, is_sat_mask, sat_pos_embed)
 
-        # Exp12: point_decoder → sat register injection
+        # Exp7: point_decoder → sat injection → depth refinement
         point_hidden = self.point_decoder(hidden, xpos=pos)
-        # Ablation B: skip sat patch injection
-        if not self.ablate_satinject:
-            point_hidden = self.sat_register_inject(point_hidden, is_sat_mask)
+        point_hidden = self.sat_to_ground_inject(point_hidden, is_sat_mask)
+        patch_pos = pos[:, self.patch_start_idx:]
+        point_hidden = torch.cat([
+            point_hidden[:, :self.patch_start_idx],
+            self.depth_refine(point_hidden[:, self.patch_start_idx:], xpos=patch_pos),
+        ], dim=1)
         if self.train_conf:
             conf_hidden = self.conf_decoder(hidden, xpos=pos)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
@@ -553,41 +468,32 @@ class Pi3(nn.Module):
             # 地面/无人机：point_head 输出 (x_norm, y_norm, z)，再相乘恢复 XY
             ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
             xy, z = ret.split([2, 1], dim=-1)
-            if self.depth_activation == 'softplus':
-                z = F.softplus(z) + 1e-6
-            else:
-                z = torch.exp(z)  # 与原始 Pi3 一致
+            z = F.softplus(z) + 1e-6  # 保证 z 正数且有梯度，避免后续乘法中断梯度流动
             grd_points_all = torch.cat([xy * z, z], dim=-1)
 
-            # Ablation E: skip orthographic sat branch — sat uses perspective same as ground
-            # Also when is_sat_mask is None (true Pi3_ori-equivalent), no sat handling
-            if self.ablate_ortho or is_sat_mask is None:
-                local_points = grd_points_all
-                sat_mpp = None
-            else:
-                # --- 卫星视图 (正交缩放先验) ---
-                # z 直接复用地面/无人机分支的 point_head 输出，不再单独预测
-                # 整图共享的 mpp 标量（由 point_hidden patch tokens 池化后回归）
-                global_mpp_logit = self.sat_mpp_head(
-                    point_hidden[:, self.patch_start_idx:].mean(dim=1)
-                ).reshape(B, N, 1, 1, 1)
-                sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_mpp_logit)  # 缩放系数恒正
+            # --- 卫星视图 (正交缩放先验) ---
+            # z 直接复用地面/无人机分支的 point_head 输出，不再单独预测
+            # 整图共享的 mpp 标量（由 point_hidden patch tokens 池化后回归）
+            global_mpp_logit = self.sat_mpp_head(
+                point_hidden[:, self.patch_start_idx:].mean(dim=1)
+            ).reshape(B, N, 1, 1, 1)
+            sat_mpp = MIN_MPP + (MAX_MPP - MIN_MPP) * torch.sigmoid(global_mpp_logit)  # 缩放系数恒正
 
-                # 像素中心坐标 (u, v) 归一到 [0,1]，减 0.5 把相机原点定在图像正中心
-                x_idx = torch.arange(W, device=z.device, dtype=sat_mpp.dtype)
-                y_idx = torch.arange(H, device=z.device, dtype=sat_mpp.dtype)
-                u = (x_idx + 0.5) / W
-                v = (y_idx + 0.5) / H
-                grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')
-                sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
+            # 像素中心坐标 (u, v) 归一到 [0,1]，减 0.5 把相机原点定在图像正中心
+            x_idx = torch.arange(W, device=z.device, dtype=sat_mpp.dtype)
+            y_idx = torch.arange(H, device=z.device, dtype=sat_mpp.dtype)
+            u = (x_idx + 0.5) / W
+            v = (y_idx + 0.5) / H
+            grid_v, grid_u = torch.meshgrid(v, u, indexing='ij')
+            sat_grid = torch.stack([grid_u, grid_v], dim=-1)  # (H, W, 2)
 
-                wh = torch.tensor([W, H], device=z.device, dtype=sat_mpp.dtype)
-                sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 像素尺度
-                sat_xy_final = sat_xy_base[None, None, :, :, :] * sat_mpp  # (B, N, H, W, 2)
-                sat_points_all = torch.cat([sat_xy_final, z], dim=-1)  # (B, N, H, W, 3)
+            wh = torch.tensor([W, H], device=z.device, dtype=sat_mpp.dtype)
+            sat_xy_base = (sat_grid - 0.5) * wh  # (H, W, 2), 像素尺度
+            sat_xy_final = sat_xy_base[None, None, :, :, :] * sat_mpp  # (B, N, H, W, 2)
+            sat_points_all = torch.cat([sat_xy_final, z], dim=-1)  # (B, N, H, W, 3)
 
-                mask = is_sat_mask.to(z.device).view(B, N, 1, 1, 1)
-                local_points = torch.where(mask, sat_points_all, grd_points_all)
+            mask = is_sat_mask.to(z.device).view(B, N, 1, 1, 1)
+            local_points = torch.where(mask, sat_points_all, grd_points_all)
 
             # confidence
             if self.train_conf:
@@ -598,26 +504,7 @@ class Pi3(nn.Module):
                 
             # camera
             camera_hidden = camera_hidden.float()
-            # C2: sat→grd injection on camera_hidden (gate init=0 → safe identity at start)
-            if self.sat_register_inject_camera is not None and is_sat_mask is not None:
-                camera_hidden = self.sat_register_inject_camera(camera_hidden, is_sat_mask)
-            # S2: grd cam tokens spatially cross-attend to sat patches (gate init=0)
-            if self.geo_xattn is not None and is_sat_mask is not None:
-                camera_hidden = self.geo_xattn(camera_hidden, is_sat_mask)
-            cam_feat = camera_hidden[:, self.patch_start_idx:]  # (B*N, hw, 512)
-            if self.use_dual_camera_head and self.camera_head_sat is not None and is_sat_mask is not None:
-                # C1: route sat views to camera_head_sat, grd views to camera_head
-                flat_mask = is_sat_mask.to(cam_feat.device).view(B * N)
-                sat_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
-                grd_idx = (~flat_mask).nonzero(as_tuple=False).squeeze(-1)
-                camera_poses_bn = torch.zeros((B * N, 4, 4), device=cam_feat.device, dtype=cam_feat.dtype)
-                if grd_idx.numel() > 0:
-                    camera_poses_bn[grd_idx] = self.camera_head(cam_feat[grd_idx], patch_h, patch_w)
-                if sat_idx.numel() > 0:
-                    camera_poses_bn[sat_idx] = self.camera_head_sat(cam_feat[sat_idx], patch_h, patch_w)
-                camera_poses = camera_poses_bn.reshape(B, N, 4, 4)
-            else:
-                camera_poses = self.camera_head(cam_feat, patch_h, patch_w).reshape(B, N, 4, 4)
+            camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
             
             # unproject local points using camera poses
             points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
