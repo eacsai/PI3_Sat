@@ -104,6 +104,7 @@ class GoogleStreetDataset(BaseDataset):
         verbose=False,
         split=False,
         shift_range=20,
+        sat_rotation_aug=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -114,6 +115,7 @@ class GoogleStreetDataset(BaseDataset):
         self.dataset_label = 'googlestreet'
         mode = self.mode
         self.data_root = data_root
+        self.sat_rotation_aug = bool(sat_rotation_aug)
         # v2 LMDB layout: one pickle blob per view, pre-resized RGB/depth and
         # pre-scaled K. Produced by scripts/pack_googlestreet_lmdb.py.
         # Use the SSD copy under /home (nvme) instead of the HDD copy under /data.
@@ -284,17 +286,41 @@ class GoogleStreetDataset(BaseDataset):
         satellite_views = []
         ground_drone_views = []
 
+        # Single pass to load all blobs and pre-transform c2w into ref-world frame.
+        loaded_blobs = []
         for prefix in sorted_prefixes:
-            # One LMDB get() per view; unpickle yields fresh numpy arrays.
             blob = self._load_view_blob(txn, folder_path, prefix)
+            blob_c2w_world = ref_w2c @ blob['c2w']
+            loaded_blobs.append((prefix, blob, blob_c2w_world))
+
+        # Sat rotation augmentation: align first ground view's heading to sat's
+        # +x axis, then add U(-pi, pi) random spin. Same angle applied to ALL
+        # sat views in the sample (they share the same physical scene).
+        sat_theta = 0.0
+        if self.sat_rotation_aug:
+            first_ground_c2w = None
+            for prefix, blob, blob_c2w_world in loaded_blobs:
+                is_g = (not bool(blob['s'])) and ('ground' in prefix) and ('pano' not in prefix)
+                if is_g:
+                    first_ground_c2w = blob_c2w_world
+                    break
+            if first_ground_c2w is not None:
+                # heading = ground camera +Z direction in world (looking dir).
+                heading = first_ground_c2w[:3, 2]
+                hx, hz = float(heading[0]), float(heading[2])
+                if (hx * hx + hz * hz) > 1e-6:
+                    theta_align = float(np.arctan2(hx, hz))
+                    phi = float(rng.uniform(-np.pi, np.pi))
+                    sat_theta = theta_align + phi
+
+        for prefix, blob, blob_c2w_world in loaded_blobs:
             K = blob['K'].copy()
-            c2w = blob['c2w']
             rgb = blob['rgb']         # (H, W, 3) uint8, pre-resized
             depth = blob['depth']     # (H, W) float32, pre-resized + pre-clipped
             is_sat = bool(blob['s'])
 
             # 以参考相机(第一张地面图)为世界坐标系，计算相对的外参。
-            c2w = ref_w2c @ c2w
+            c2w = blob_c2w_world
 
             if is_sat:
                 # Sat RGB is already at SAT_TARGET (1024). Apply the random
@@ -354,6 +380,42 @@ class GoogleStreetDataset(BaseDataset):
                 info=folder_path,
                 sat=is_sat,
             )
+
+            # Sat rotation augmentation: spin sat image around its principal
+            # point by sat_theta (radians, camera +Z_cam = +Y_world = down).
+            # cv2 angle convention: positive degrees = visual CCW, which
+            # matches how content visually rotates when camera spins by
+            # +sat_theta around its optical axis.
+            if is_sat and self.sat_rotation_aug and abs(sat_theta) > 1e-6:
+                rgb_np = np.asarray(rgb)
+                H_sat, W_sat = depth.shape
+                cx_rot, cy_rot = (W_sat - 1) / 2.0, (H_sat - 1) / 2.0
+                angle_deg = float(np.degrees(sat_theta))
+                M_rot = cv2.getRotationMatrix2D((cx_rot, cy_rot), angle_deg, 1.0)
+                rgb_rot = cv2.warpAffine(
+                    rgb_np, M_rot, (W_sat, H_sat),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                depth_rot = cv2.warpAffine(
+                    depth.astype(np.float32), M_rot, (W_sat, H_sat),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0.0,
+                )
+                rgb = Image.fromarray(rgb_rot)
+                depth = depth_rot
+
+                cos_t = float(np.cos(sat_theta))
+                sin_t = float(np.sin(sat_theta))
+                R_z_cam = np.array([
+                    [cos_t, -sin_t, 0.0],
+                    [sin_t,  cos_t, 0.0],
+                    [0.0,    0.0,   1.0],
+                ], dtype=c2w.dtype)
+                c2w = c2w.copy()
+                c2w[:3, :3] = c2w[:3, :3] @ R_z_cam
 
             # 确保卫星图的深度始终为非负（对应相机坐标系 z>=0），
             # 这样后续在 loss 中就不用再依赖「卫星图在第 0 个视角」去做特殊裁剪。

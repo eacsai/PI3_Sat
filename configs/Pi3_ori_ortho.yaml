@@ -1,0 +1,13 @@
+# @package _global_
+# Ablation I lowres
+defaults:
+  - model: pi3_googlestreet_sat_Pi3_ori_ortho.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Pi3_ori_ortho

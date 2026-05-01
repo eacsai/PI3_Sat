@@ -1,0 +1,16 @@
+# @package _global_
+# C1_satrot: same architecture and training schedule as C1, but adds sat
+# rotation augmentation: each sample first aligns the sat image so the first
+# ground view's heading lands on the sat image's right axis, then adds an
+# extra U(-pi, pi) random spin and updates the sat extrinsic accordingly.
+defaults:
+  - model: pi3_googlestreet_sat_C1.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat_rotaug.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/C1_satrot

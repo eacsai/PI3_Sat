@@ -1,0 +1,24 @@
+# @package _global_
+# Ablation I highres
+defaults:
+  - model: pi3_googlestreet_sat_Pi3_ori_ortho.yaml
+  - train: train_pi3_highres
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Pi3_ori_ortho_highres
+
+train:
+    image_num_range: [2, 3]
+    max_img_per_gpu: 24
+    pixel_count_range: [100000, 255000]
+    iters_per_epoch: 170
+    num_epoch: 30
+
+model:
+    load_pi3: false
+    ckpt: /home/wangqw/video_program/Pi3/outputs/saved_runs/Pi3_ori_ortho/ckpts/best_model/pytorch_model.bin

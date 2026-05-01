@@ -1,0 +1,16 @@
+- [Naming: CrossGeo + Cross3R](project_naming_conventions.md) — Paper-facing names: CrossGeo = googlestreet_sat dataset, Cross3R = C1_highres architecture/weights. Internal code names unchanged.
+- [Sat tuning experiments](project_tuning_experiments.md) — Exp1-15 done (best Exp6=57.46); Pi3_ori baseline=57.20 invalidates sat-utilization claims of Exp7-15; Exp16-18 frozen-backbone pending
+- [Highres @504 results](project_highres_504_results.md) — C1_highres best (δ-Mean 63.68 / AUC 81.83); C2_highres 61.10/79.98; Pi3_ori_highres 59.53/80.62
+- [KITTI fine-tune](project_kitti_finetune.md) — KITTI cross-view pipeline + camera-only fine-tune; plateaus and underperforms baseline; sat_mpp_head sigmoid bound blocks projection loss
+- [C1_satrot training](project_satrot_training.md) — C1 + sat rotation aug (align to ground heading + U(-π,π)); lowres best ep27 val=0.0598, highres best ep28 val=0.0801; benefit expected on rotated KITTI not in-distribution test
+- [Training infra setup](project_training_setup.md) — GPU layout, launch commands, output paths, eval script, frozen model config
+- [User profile](user_researcher.md) — Researcher doing multi-view 3D recon with satellite, runs systematic ablations, communicates in Chinese
+- [Python env](feedback_python_env.md) — Always use pi3 conda env for all Python in this project
+- [No /tmp files](feedback_no_tmp.md) — All files must be saved within the project directory, never /tmp
+- [NeurIPS26Paper writable](feedback_neurips26paper_dir.md) — Free read/write under /home/wangqw/NeurIPS26Paper/ (paper-writing project), but never touch *.bib files there
+- [Eval metric: δ + AUC@30](feedback_eval_metric.md) — Judge module usefulness by averaging δ-mean AND AUC@30, not δ alone
+- [Always use exp(z)](feedback_exp_z_activation.md) — All sat experiments must use z = torch.exp(z), never softplus, to match Pi3_ori
+- [504 eval = highres weights](feedback_highres_eval_default.md) — When user asks "test best weights @504", they mean the *_highres ckpts, not lowres baselines
+- [CSV dirty aggregates](feedback_csv_dirty_aggregates.md) — Aggregate eval CSVs append rows; recompute from per-sample _all_samples.csv to get clean numbers
+- [clip_loss zeros large losses](feedback_clip_loss_gotcha.md) — train.clip_loss=10 silently sends loss→0 for fine-tunes with hundreds-scale initial loss; bump to 2000+
+- [Freeze after DDP needs .module](feedback_freeze_after_ddp.md) — Post-accelerator.prepare freezing must walk through model.module to reach the real submodules
