@@ -1,0 +1,15 @@
+# @package _global_
+# Cross3R sat-altitude ablation: train with sat_gap = 200 m (baseline = 150 m).
+# Lowres only, ~5100 total optim steps, eval at 224x224.
+
+defaults:
+  - model: pi3_googlestreet_sat_C1_no_dualcam.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat_satgap200.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Cross3R_satgap200

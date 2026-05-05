@@ -1,0 +1,58 @@
+# @package _global_
+# Cross3R sat-altitude ablation: redefine sat camera y to -100 m (vs 150 m baseline).
+
+train_dataset:
+    length: 39000
+
+    weights:
+        GoogleStreet: 39000
+
+    GoogleStreet:
+        _target_: datasets.googlestreet_dataset.GoogleStreetDataset
+        data_root: /data/zhongyao/dataset/
+        split: True
+        shift_range: 20
+        z_far: 30000
+        frame_num: 3
+        aug_crop: 16
+        use_query: false
+        use_sat: true
+        sat_gap: 100
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: 'train'
+        shuffle: false
+        query_sample_count: 8192
+
+train_dataloader:
+    drop_last: True
+    shuffle: True
+
+test_dataset:
+    weights:
+        GoogleStreet: 450
+
+    GoogleStreet:
+        _target_: datasets.googlestreet_dataset.GoogleStreetDataset
+        data_root: /data/zhongyao/dataset/
+        split: True
+        shift_range: 20
+        z_far: 30000
+        frame_num: 3
+        use_query: false
+        use_sat: true
+        sat_gap: 100
+        resolution:
+            - [252, 252]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+        shuffle: false
+        query_sample_count: 8192
+
+test_dataloader:
+    drop_last: False
+    shuffle: False

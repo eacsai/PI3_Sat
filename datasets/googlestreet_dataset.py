@@ -105,6 +105,8 @@ class GoogleStreetDataset(BaseDataset):
         split=False,
         shift_range=20,
         sat_rotation_aug=False,
+        data_pct=1.0,
+        sat_gap=150,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -141,17 +143,23 @@ class GoogleStreetDataset(BaseDataset):
         self.dir_cache = cached
 
         all_paths = get_sorted_pair_paths(data_root, split=False, mode=mode)
-        # 只使用 60% 的数据
-        # all_paths = all_paths[:int(len(all_paths) * 0.6)]
         self.file_paths = [p for p in all_paths if p in self.dir_cache]
+        # Optional: keep only the first `data_pct` fraction of folders (deterministic
+        # subset taken from the natural-key sorted list). Default 1.0 = no subset.
+        # Used for data-scaling ablations (Cross3R_data20 / 40 / 60 / 80).
+        self.data_pct = float(data_pct)
+        if 0.0 < self.data_pct < 1.0:
+            n_keep = int(len(self.file_paths) * self.data_pct)
+            self.file_paths = self.file_paths[:n_keep]
         if self.verbose:
             print(
                 f"[{self.dataset_label}] {len(self.file_paths)}/{len(all_paths)} folders available in LMDB"
+                + (f" (data_pct={self.data_pct})" if self.data_pct < 1.0 else "")
             )
 
         self.shift_range = shift_range
         self.sat_height = 5726
-        self.sat_gap = 150
+        self.sat_gap = sat_gap
 
     def _load_dir_cache_from_disk(self) -> dict:
         """Open the LMDB briefly, read __VERSION__ + __DIR_CACHE__, close it."""

@@ -1,0 +1,14 @@
+# @package _global_
+# Pi3_ori w/ raw sat height — vanilla pi3_training.Pi3, no sat-aware modules,
+# but training data uses raw sat camera height (override_sat_height=false).
+defaults:
+  - model: pi3_googlestreet_ori.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_ori_rawh.yaml
+  - general: googlestreet_ori.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Pi3_ori_rawh

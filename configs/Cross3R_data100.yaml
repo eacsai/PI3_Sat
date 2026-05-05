@@ -1,0 +1,15 @@
+# @package _global_
+# Cross3R data-scaling reference: train on 100% of CrossGeo data, lowres only.
+# Also serves as the canonical Cross3R lowres ckpt (the previous one was
+# accidentally deleted; the highres ckpt at C1_no_dualcam_highres remains).
+defaults:
+  - model: pi3_googlestreet_sat_C1_no_dualcam.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Cross3R_data100

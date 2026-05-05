@@ -1,0 +1,18 @@
+# @package _global_
+# Cross3R data-scaling ablation: train on 60% of CrossGeo data, lowres only.
+defaults:
+  - model: pi3_googlestreet_sat_C1_no_dualcam.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat_data60.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Cross3R_data60
+
+# 60% data: dataset per-rank ≈ 3340 → iters ≤ 104. Total steps ≈ 5100.
+train:
+    iters_per_epoch: 100
+    num_epoch: 51

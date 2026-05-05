@@ -36,6 +36,7 @@ class BaseDataset(EasyDataset):
         use_sat=True,
         query_sample_count=8192,
         patch_size=0,
+        override_sat_height=True,
     ):
         super().__init__()
         self.frame_num = frame_num
@@ -77,6 +78,12 @@ class BaseDataset(EasyDataset):
         self.use_sat = use_sat
         self.query_sample_count = query_sample_count
         self.patch_size = patch_size
+        # When True (default = legacy behaviour), the satellite c2w's y component
+        # is overwritten with -view['sat_gap'] (= -150) for both the model's
+        # pose GT (camera_pose) and the depth-validation pose (camera_pose_new).
+        # When False, the raw c2w from the LMDB blob (after ref_w2c transform)
+        # is used unchanged.
+        self.override_sat_height = bool(override_sat_height)
     def set_epoch(self, epoch, base_seed=None):
         """每个 epoch 更新一次；与 pi3_trainer.before_epoch 中 dataset.set_epoch 对齐。"""
         if base_seed is not None:
@@ -261,8 +268,12 @@ class BaseDataset(EasyDataset):
                     view['z_far'] = self.z_far
                     if 'satellite' in view['label']:
                         view['camera_pose_ori'] = view['camera_pose'] # cam2world
-                        camera_pose_new = view['camera_pose'].copy()# if no ground drone view, just use the sat_gap as the y value for satellite view
-                        camera_pose_new[1,3] = -view['sat_gap']
+                        camera_pose_new = view['camera_pose'].copy()
+                        # Optionally overwrite the sat camera's y component with -sat_gap
+                        # (legacy behaviour). When override_sat_height=False, keep the
+                        # raw c2w from the LMDB blob (post ref_w2c transform).
+                        if self.override_sat_height:
+                            camera_pose_new[1,3] = -view['sat_gap']
                         view['camera_pose_new'] = se3_inverse(camera_pose_new) # world2cam
                         pts3d, valid_mask = satellite_depthmap_to_absolute_camera_coordinates(**view)
                         view['camera_pose'] = camera_pose_new # cam2world

@@ -88,7 +88,11 @@ def satellite_depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsic
     X_world = np.einsum("ik, vuk -> vui", R_cam2world, X_cam) + t_cam2world[None, None, :]
     X_camera_new = np.einsum("ik, vuk -> vui", R_world2cam_new, X_world) + t_world2cam_new[None, None, :]
     new_depthmap = X_camera_new[:, :, 2]
-    valid_mask = (new_depthmap > 1e-5) & valid_mask & (new_depthmap < 500)
+    # Upper bound widened from 500 to 10000 m so that BaseDataset's
+    # override_sat_height=False path (raw sat at ~5700 m) is not silently
+    # filtered to empty. Default override path (sat at ~150 m) is unaffected
+    # because depths in the new camera frame are ~100-200 m, far below 10000.
+    valid_mask = (new_depthmap > 1e-5) & valid_mask & (new_depthmap < 10000)
 
     return X_world, valid_mask
 
