@@ -1,0 +1,18 @@
+# @package _global_
+# Cross3R-DualSat: lowres-only training (224x224, ~5100 steps).
+# Architecture identical to Cross3R = C1_no_dualcam but the sat branch
+# now emits two local-point predictions (ortho + perspective). Both are
+# supervised at training time with equal weight. The chained highres
+# stage is configured in Cross3R_dualsat_highres.yaml.
+
+defaults:
+  - model: pi3_googlestreet_sat_Cross3R_dualsat.yaml
+  - train: train_pi3_lowres_megadepth
+  - data: googlestreet_sat.yaml
+  - general: googlestreet_sat.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+name: saved_runs/Cross3R_dualsat
